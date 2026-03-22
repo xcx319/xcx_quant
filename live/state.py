@@ -36,6 +36,12 @@ class AppState:
 
     # Trading toggle (default OFF — must be enabled via dashboard)
     trading_enabled: bool = False
+    daily_trade_limit: int = config.MAX_TRADES_PER_DAY
+    leverage: int = config.LEVERAGE
+    trade_notional: float = config.TRADE_NOTIONAL
+    risk_per_trade: float = config.RISK_PER_TRADE
+    max_capital: float = config.MAX_CAPITAL
+    daily_loss_limit_r: float = config.DAILY_LOSS_LIMIT_R
 
     # Logs
     signals: list = field(default_factory=list)
@@ -58,6 +64,12 @@ class AppState:
             "signals_count": len(self.signals),
             "trades_count": len(self.trades),
             "trading_enabled": self.trading_enabled,
+            "daily_trade_limit": self.daily_trade_limit,
+            "leverage": self.leverage,
+            "trade_notional": self.trade_notional,
+            "risk_per_trade": self.risk_per_trade,
+            "max_capital": self.max_capital,
+            "daily_loss_limit_r": self.daily_loss_limit_r,
         }
 
 

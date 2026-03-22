@@ -43,22 +43,45 @@ _min_sz: float = 0.01  # minimum order size, fetched on startup
 _lever: int = 10  # leverage, fetched on startup
 
 
-def _calc_position_size(price: float) -> str:
-    """Compute number of contracts, rounded down to lotSz. Returns string for API.
+def _calc_position_size(price: float, atr: float, sl_mult: float) -> str:
+    """Risk-based position sizing with auto-leverage.
 
-    margin = INITIAL_CAPITAL * RISK_PER_TRADE  (e.g. 100 * 0.20 = 20 USDT)
-    notional = margin * leverage              (e.g. 20 * 10 = 200 USDT)
-    contracts = notional / (ctVal * price)    (e.g. 200 / (0.1 * 2123) = 0.94)
+    max_loss = notional * R
+    contracts = max_loss / (sl_mult * atr * ctVal)
+    leverage  = ceil(contracts * ctVal * price / max_capital)
+
+    Returns contract count string for OKX API.
     """
-    if price <= 0 or _ct_val <= 0:
+    import math
+    global _lever
+    if price <= 0 or _ct_val <= 0 or atr <= 0 or sl_mult <= 0:
         return str(_min_sz)
-    margin = config.INITIAL_CAPITAL * config.RISK_PER_TRADE
-    notional = margin * _lever
-    contracts = notional / (_ct_val * price)
+    max_loss = state.trade_notional * state.risk_per_trade
+    loss_per_contract = sl_mult * atr * _ct_val
+    contracts = max_loss / loss_per_contract
     # Round down to lot size
     contracts = int(contracts / _lot_sz) * _lot_sz
     contracts = max(_min_sz, contracts)
+
+    # Auto-adjust leverage so max_capital can cover the margin
+    notional = contracts * _ct_val * price
+    required_lever = max(1, math.ceil(notional / state.max_capital))
+    if required_lever != _lever:
+        logger.info(f"Adjusting leverage: {_lever}x -> {required_lever}x "
+                    f"(notional={notional:.1f}, max_capital={state.max_capital})")
+        try:
+            result = executor.set_leverage(required_lever)
+            if result.get("code") == "0":
+                _lever = required_lever
+                state.leverage = _lever
+            else:
+                logger.warning(f"Failed to set leverage to {required_lever}x: {result}")
+        except Exception as e:
+            logger.warning(f"set_leverage error: {e}")
+
     return f"{contracts:.2f}".rstrip('0').rstrip('.')
+
+
 
 # --- Broadcast to dashboard clients ---
 async def broadcast(event_type: str, data: dict):
@@ -184,15 +207,15 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
     # Check daily loss limit and max trades per day
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_trades = [t for t in state.trades if str(t.get("time", "")).startswith(today_str)]
-    if len(today_trades) >= config.MAX_TRADES_PER_DAY:
-        logger.info(f"Daily trade limit reached ({config.MAX_TRADES_PER_DAY}), skipping")
+    if len(today_trades) >= state.daily_trade_limit:
+        logger.info(f"Daily trade limit reached ({state.daily_trade_limit}), skipping")
         return
     today_pnl_r = sum(
         t.get("pnl", 0) / max(t.get("atr", 1) * _ct_val * float(t.get("size", 1)), 1e-9)
         for t in today_trades if t.get("pnl") is not None
     )
-    if today_pnl_r <= config.DAILY_LOSS_LIMIT_R:
-        logger.info(f"Daily loss limit hit ({today_pnl_r:.1f}R <= {config.DAILY_LOSS_LIMIT_R}R), skipping")
+    if today_pnl_r <= state.daily_loss_limit_r:
+        logger.info(f"Daily loss limit hit ({today_pnl_r:.1f}R <= {state.daily_loss_limit_r}R), skipping")
         return
 
     # Check position limit
@@ -219,7 +242,7 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
         side = "sell"
 
     try:
-        size = _calc_position_size(entry_for_tpsl)
+        size = _calc_position_size(entry_for_tpsl, atr, config.SL_MULT)
         order_result = executor.place_market_order(side, size, tp_price, sl_price)
         if order_result.get("code") == "0":
             ord_id = order_result.get("data", [{}])[0].get("ordId", "")
@@ -620,6 +643,19 @@ def _check_breakeven_stop():
     if new_sl != current_sl:
         logger.info(f"Breakeven stop: SL moved {current_sl:.2f} -> {new_sl:.2f} (max_fav={pos['max_fav_r']:.2f}R)")
         pos["sl"] = new_sl
+        # Sync new SL to OKX algo order (cancel old TP/SL, place new)
+        tp = pos.get("tp", 0)
+        close_side = "sell" if side == "buy" else "buy"
+        size = pos.get("size", str(_min_sz))
+        try:
+            ok = executor.update_tpsl(new_tp=tp, new_sl=new_sl,
+                                      close_side=close_side, size=size)
+            if ok:
+                logger.info(f"OKX algo order updated: TP={tp:.2f}, SL={new_sl:.2f}")
+            else:
+                logger.warning("Failed to update OKX algo order, local SL still active")
+        except Exception as e:
+            logger.warning(f"update_tpsl error: {e}")
         # Check if current price already breaches new SL
         breached = (side == "buy" and price <= new_sl) or (side == "sell" and price >= new_sl)
         if breached:
@@ -675,8 +711,8 @@ def _process_position_data(active: list):
         pos_data["tp"] = state.open_position.get("tp", 0)
         pos_data["sl"] = state.open_position.get("sl", 0)
         pos_data["open_time"] = state.open_position.get("time", "")
-        # Breakeven stop: dynamically adjust SL based on favorable excursion
-        _check_breakeven_stop()
+        # Breakeven stop disabled — evaluated and found to hurt performance
+        # _check_breakeven_stop()
         # Horizon timeout check
         open_ts = state.open_position.get("open_ts", 0)
         elapsed_s = time.time() - open_ts if open_ts else 0
@@ -790,6 +826,7 @@ async def lifespan(app: FastAPI):
         lev_result = executor.set_leverage(config.LEVERAGE)
         if lev_result.get("code") == "0":
             _lever = config.LEVERAGE
+            state.leverage = _lever
             logger.info(f"Leverage set successfully: _lever={_lever}")
         else:
             logger.warning(f"Failed to set leverage: {lev_result}, using default _lever={_lever}")
@@ -883,6 +920,60 @@ async def trading_toggle(body: TradingToggle):
     logger.info(f"Trading {'enabled' if body.enabled else 'disabled'} via dashboard")
     await broadcast("health", state.snapshot())
     return {"trading_enabled": state.trading_enabled}
+
+
+class DailyTradeLimit(BaseModel):
+    limit: int
+
+
+@app.post("/api/daily-trade-limit")
+async def set_daily_trade_limit(body: DailyTradeLimit):
+    state.daily_trade_limit = max(0, body.limit)
+    logger.info(f"Daily trade limit set to {state.daily_trade_limit} via dashboard")
+    await broadcast("health", state.snapshot())
+    return {"daily_trade_limit": state.daily_trade_limit}
+
+
+class RiskParams(BaseModel):
+    trade_notional: float | None = None
+    risk_per_trade: float | None = None
+    max_capital: float | None = None
+    daily_loss_limit_r: float | None = None
+
+
+@app.post("/api/risk-params")
+async def set_risk_params(body: RiskParams):
+    import math
+    if body.trade_notional is not None:
+        state.trade_notional = max(0, body.trade_notional)
+    if body.risk_per_trade is not None:
+        state.risk_per_trade = max(0, min(1, body.risk_per_trade))
+    if body.max_capital is not None:
+        state.max_capital = max(0, body.max_capital)
+    if body.daily_loss_limit_r is not None:
+        state.daily_loss_limit_r = min(0, body.daily_loss_limit_r)
+    # Preview leverage needed at current price/ATR
+    preview_lever = _lever
+    if state.current_price > 0 and _ct_val > 0 and state.max_capital > 0 and state.current_atr > 0 and config.SL_MULT > 0:
+        max_loss = state.trade_notional * state.risk_per_trade
+        loss_per_contract = config.SL_MULT * state.current_atr * _ct_val
+        contracts = max_loss / loss_per_contract
+        contracts = int(contracts / _lot_sz) * _lot_sz
+        contracts = max(_min_sz, contracts)
+        notional = contracts * _ct_val * state.current_price
+        preview_lever = max(1, math.ceil(notional / state.max_capital))
+    logger.info(f"Risk params updated: notional={state.trade_notional} "
+                f"R={state.risk_per_trade} max_capital={state.max_capital} "
+                f"daily_loss={state.daily_loss_limit_r} preview_lever={preview_lever}x")
+    state.leverage = preview_lever
+    await broadcast("health", state.snapshot())
+    return {
+        "trade_notional": state.trade_notional,
+        "risk_per_trade": state.risk_per_trade,
+        "max_capital": state.max_capital,
+        "daily_loss_limit_r": state.daily_loss_limit_r,
+        "leverage": preview_lever,
+    }
 
 
 def _dedup_bars(bars: list) -> list:

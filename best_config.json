@@ -2,7 +2,7 @@
   "h": 5,
   "tp": 2.5,
   "sl": 1.5,
-  "threshold": 0.5073,
+  "threshold": 0.54,
   "label_mode": "first_touch",
   "same_bar_policy": "drop",
   "scanner_name": "flow_reversal",

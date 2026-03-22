@@ -135,5 +135,69 @@ class OrderExecutor:
         logger.info(f"Close result: {result}")
         return result
 
+    def get_algo_orders_pending(self, ord_type: str = "conditional") -> list[dict]:
+        """Fetch pending algo orders for INST_ID."""
+        r = self._get("/api/v5/trade/orders-algo-pending", {
+            "instId": config.INST_ID,
+            "ordType": ord_type,
+        })
+        return r.get("data", [])
+
+    def cancel_algo_order(self, algo_id: str) -> dict:
+        """Cancel a single algo order."""
+        body = [{"instId": config.INST_ID, "algoId": algo_id}]
+        logger.info(f"Cancelling algo order: {algo_id}")
+        result = self._post("/api/v5/trade/cancel-algos", body)
+        logger.info(f"Cancel algo result: {result}")
+        return result
+
+    def place_algo_tpsl(self, side: str, size: str, tp_price: float, sl_price: float) -> dict:
+        """Place a new TP/SL algo order for an existing position.
+        side: the closing side ('sell' for long position, 'buy' for short position)
+        """
+        body = {
+            "instId": config.INST_ID,
+            "tdMode": config.TD_MODE,
+            "side": side,
+            "ordType": "oco",
+            "sz": size,
+            "tpTriggerPx": f"{tp_price:.2f}",
+            "tpOrdPx": "-1",
+            "slTriggerPx": f"{sl_price:.2f}",
+            "slOrdPx": "-1",
+        }
+        logger.info(f"Placing TP/SL algo: {side} {size}, TP={tp_price:.2f}, SL={sl_price:.2f}")
+        result = self._post("/api/v5/trade/order-algo", body)
+        logger.info(f"Algo order result: {result}")
+        return result
+
+    def update_tpsl(self, new_tp: float | None, new_sl: float | None,
+                    close_side: str, size: str) -> bool:
+        """Cancel existing TP/SL algo orders and place new ones.
+        Returns True if successful.
+        """
+        # Find and cancel existing algo orders
+        try:
+            pending = self.get_algo_orders_pending()
+            for algo in pending:
+                algo_id = algo.get("algoId", "")
+                if algo_id:
+                    self.cancel_algo_order(algo_id)
+        except Exception as e:
+            logger.warning(f"Failed to cancel existing algo orders: {e}")
+            return False
+
+        # Place new TP/SL
+        try:
+            # Use current values if not provided
+            if new_tp is None or new_sl is None:
+                logger.warning("update_tpsl requires both TP and SL")
+                return False
+            result = self.place_algo_tpsl(close_side, size, new_tp, new_sl)
+            return result.get("code") == "0"
+        except Exception as e:
+            logger.error(f"Failed to place new TP/SL algo: {e}")
+            return False
+
     def close(self):
         self._client.close()

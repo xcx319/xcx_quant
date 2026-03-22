@@ -99,6 +99,21 @@ h3{color:#94a3b8;font-size:13px;text-transform:uppercase;letter-spacing:1px;marg
 .toggle input:checked+.slider{background:#064e3b}
 .toggle input:checked+.slider::before{transform:translateX(16px);background:#22c55e}
 
+/* Risk param inputs */
+.param-row{display:flex;justify-content:space-between;align-items:center;font-size:13px;padding:3px 0}
+.param-row .param-label{color:#64748b;flex:1}
+.param-row .param-val{display:flex;align-items:center;gap:4px;width:130px;justify-content:flex-end}
+.param-active{color:#c8d6e5;font-size:13px;min-width:36px;text-align:right}
+.param-sep{color:#374151;font-size:11px}
+.param-input{width:50px;background:#0a0e17;border:1px solid #374151;border-radius:4px;color:#c8d6e5;text-align:right;font-size:13px;padding:3px 6px;font-family:inherit;-moz-appearance:textfield}
+.param-input::-webkit-inner-spin-button,.param-input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.param-input:focus{outline:none;border-color:#3b82f6}
+.param-unit{color:#64748b;font-size:12px;width:10px;text-align:left}
+body.light .param-input{background:#f8fafc;border-color:#cbd5e1;color:#1e293b}
+body.light .param-input:focus{border-color:#3b82f6}
+body.light .param-row .param-label{color:#64748b}
+body.light .param-active{color:#1e293b}
+
 /* Selection prevention during drag */
 .dragging{user-select:none;-webkit-user-select:none;cursor:col-resize!important}
 .dragging *{cursor:col-resize!important}
@@ -191,6 +206,63 @@ body.light .theme-btn:hover{border-color:#2563eb;color:#2563eb}
       <div id="ob-bids"></div>
       <div class="obi-gauge"><div class="obi-fill" id="obi-fill" style="width:50%;background:#64748b"></div></div>
       <div class="obi-label" id="obi-label">OBI: --</div>
+      <div style="margin-top:12px;padding-top:8px;border-top:1px solid #1e293b">
+        <h3 style="margin-bottom:6px">Risk Params</h3>
+        <div class="param-row">
+          <span class="param-label">Daily Trades</span>
+          <div class="param-val">
+            <span id="daily-trades-used" style="color:#94a3b8;font-size:12px">0</span>
+            <span class="param-sep">/</span>
+            <span id="disp-daily-limit" class="param-active">10</span>
+            <span class="param-sep">→</span>
+            <input id="daily-limit-input" class="param-input" type="number" min="0" max="100" step="1" value="10">
+            <span class="param-unit"></span>
+          </div>
+        </div>
+        <div class="param-row">
+          <span class="param-label">Leverage</span>
+          <div class="param-val">
+            <span id="param-leverage-display" class="param-active">1</span>
+            <span class="param-unit">x</span>
+          </div>
+        </div>
+        <div class="param-row">
+          <span class="param-label">Notional</span>
+          <div class="param-val">
+            <span id="disp-notional" class="param-active">100</span>
+            <span class="param-sep">→</span>
+            <input id="param-notional" class="param-input" type="number" min="0" step="50" value="100">
+            <span class="param-unit">U</span>
+          </div>
+        </div>
+        <div class="param-row">
+          <span class="param-label">Risk/Trade</span>
+          <div class="param-val">
+            <span id="disp-risk" class="param-active">8%</span>
+            <span class="param-sep">→</span>
+            <input id="param-risk" class="param-input" type="number" min="0" max="1" step="0.01" value="0.08">
+            <span class="param-unit"></span>
+          </div>
+        </div>
+        <div class="param-row">
+          <span class="param-label">Max Capital</span>
+          <div class="param-val">
+            <span id="disp-max-capital" class="param-active">200</span>
+            <span class="param-sep">→</span>
+            <input id="param-max-capital" class="param-input" type="number" min="0" step="10" value="200">
+            <span class="param-unit">U</span>
+          </div>
+        </div>
+        <div class="param-row">
+          <span class="param-label">Daily Loss</span>
+          <div class="param-val">
+            <span id="disp-daily-loss" class="param-active">-5</span>
+            <span class="param-sep">→</span>
+            <input id="param-daily-loss" class="param-input" type="number" max="0" step="0.5" value="-5">
+            <span class="param-unit">R</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
   <div class="gutter-v" id="gutter-left"></div>
@@ -488,6 +560,8 @@ function updateHealth(h) {
   document.getElementById('warmup-fill').style.width = pct + '%';
   if (h.current_price) updatePrice(h.current_price);
   if (h.trading_enabled !== undefined) syncToggle(h.trading_enabled);
+  if (h.daily_trade_limit !== undefined) syncDailyLimit(h.daily_trade_limit);
+  syncRiskParams(h);
 }
 
 function updateOrderbook(ob) {
@@ -741,6 +815,71 @@ document.getElementById('trading-toggle').addEventListener('change', async funct
   } catch(e) { console.warn('Toggle error:', e); this.checked = !enabled; }
 });
 
+// Daily trade limit
+const dailyLimitInput = document.getElementById('daily-limit-input');
+let _limitTimer = null;
+dailyLimitInput.addEventListener('change', sendDailyLimit);
+dailyLimitInput.addEventListener('input', function() {
+  clearTimeout(_limitTimer);
+  _limitTimer = setTimeout(sendDailyLimit, 600);
+});
+async function sendDailyLimit() {
+  const limit = parseInt(dailyLimitInput.value, 10);
+  if (isNaN(limit) || limit < 0) return;
+  try {
+    await fetch('/api/daily-trade-limit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({limit})});
+  } catch(e) { console.warn('Limit error:', e); }
+}
+function syncDailyLimit(limit) {
+  if (limit !== undefined) {
+    document.getElementById('disp-daily-limit').textContent = limit;
+    if (dailyLimitInput !== document.activeElement) dailyLimitInput.value = limit;
+  }
+}
+function updateDailyTradesUsed(trades) {
+  const todayUTC = new Date().toISOString().slice(0, 10);
+  const count = trades.filter(t => String(t.time || '').startsWith(todayUTC)).length;
+  document.getElementById('daily-trades-used').textContent = count;
+}
+
+// Risk params (trade_notional, max_capital, daily_loss_limit_r)
+const _riskFields = [
+  {id: 'param-notional', key: 'trade_notional', parse: parseFloat, disp: 'disp-notional'},
+  {id: 'param-risk', key: 'risk_per_trade', parse: parseFloat, disp: 'disp-risk', fmt: v => Math.round(v*100)+'%'},
+  {id: 'param-max-capital', key: 'max_capital', parse: parseFloat, disp: 'disp-max-capital'},
+  {id: 'param-daily-loss', key: 'daily_loss_limit_r', parse: parseFloat, disp: 'disp-daily-loss'},
+];
+let _riskTimer = null;
+_riskFields.forEach(f => {
+  const el = document.getElementById(f.id);
+  el.addEventListener('change', sendRiskParams);
+  el.addEventListener('input', () => { clearTimeout(_riskTimer); _riskTimer = setTimeout(sendRiskParams, 600); });
+});
+async function sendRiskParams() {
+  const body = {};
+  _riskFields.forEach(f => {
+    const v = f.parse(document.getElementById(f.id).value);
+    if (!isNaN(v)) body[f.key] = v;
+  });
+  try {
+    await fetch('/api/risk-params', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  } catch(e) { console.warn('Risk params error:', e); }
+}
+function syncRiskParams(h) {
+  _riskFields.forEach(f => {
+    if (h[f.key] !== undefined) {
+      const el = document.getElementById(f.id);
+      if (el !== document.activeElement) el.value = h[f.key];
+      // Update display value
+      const disp = document.getElementById(f.disp);
+      if (disp) disp.textContent = f.fmt ? f.fmt(h[f.key]) : h[f.key];
+    }
+  });
+  if (h.leverage !== undefined) {
+    document.getElementById('param-leverage-display').textContent = h.leverage;
+  }
+}
+
 // Theme toggle
 const DARK_THEME = {layout:{background:{color:'#111827'},textColor:'#94a3b8'},grid:{vertLines:{color:'#1e293b'},horzLines:{color:'#1e293b'}},rightPriceScale:{borderColor:'#1e293b'}};
 const LIGHT_THEME = {layout:{background:{color:'#ffffff'},textColor:'#334155'},grid:{vertLines:{color:'#e2e8f0'},horzLines:{color:'#e2e8f0'}},rightPriceScale:{borderColor:'#e2e8f0'}};
@@ -797,7 +936,6 @@ function connectWS() {
           .sort((a, b) => Number(a.close_time) - Number(b.close_time));
         cumR = 0;
         if (closedTrades.length > 0) {
-          // Start from zero at the open time of the first trade
           const firstOpenTs = closedTrades[0].open_ts || closedTrades[0].ts;
           if (firstOpenTs) eqData.push({time: toBJ(Math.floor(Number(firstOpenTs))), value: 0});
         }
@@ -805,10 +943,25 @@ function connectWS() {
           cumR += Number(t.pnl);
           eqData.push({time: toBJ(Math.floor(Number(t.close_time))), value: cumR});
         });
-        // Also count trades without close_time but with pnl
         msg.data.trades.filter(t => t.pnl != null && !t.close_time).forEach(t => {
           cumR += Number(t.pnl);
         });
+        // Extend curve to current time with hourly points for visible flat line
+        const nowT = toBJ(Math.floor(Date.now()/1000));
+        const lastT = eqData.length > 0 ? eqData[eqData.length-1].time : 0;
+        if (nowT > lastT) {
+          const step = 3600; // 1 hour
+          for (let t = lastT + step; t < nowT; t += step) {
+            eqData.push({time: t, value: cumR});
+          }
+          eqData.push({time: nowT, value: cumR});
+        }
+        // Deduplicate: keep last value per timestamp (LightweightCharts requires strictly ascending)
+        const eqMap = new Map();
+        eqData.forEach(p => eqMap.set(p.time, p.value));
+        eqData.length = 0;
+        for (const [t, v] of eqMap) eqData.push({time: t, value: v});
+        eqData.sort((a, b) => a.time - b.time);
         if (eqData.length > 0) { eqSeries.setData(eqData); eqChart.timeScale().fitContent(); }
       }
       if (msg.data.health) updateHealth(msg.data.health);
@@ -818,6 +971,7 @@ function connectWS() {
       if (msg.data.position) updatePosition(msg.data.position);
       if (msg.data.foreign_positions) updateForeignPositions(msg.data.foreign_positions);
       if (msg.data.trading_enabled !== undefined) syncToggle(msg.data.trading_enabled);
+      if (msg.data.trades) updateDailyTradesUsed(msg.data.trades);
     } else if (msg.type === 'price') {
       const bar = {...msg.data, time: toBJ(msg.data.time)};
       candleSeries.update(bar);
@@ -833,7 +987,10 @@ function connectWS() {
       updateTrade(msg.data);
       const pnl = Number(msg.data.pnl || 0);
       cumR += pnl;
-      eqData.push({time: toBJ(Math.floor(Date.now()/1000)), value: cumR});
+      const t = toBJ(Math.floor(Date.now()/1000));
+      const last = eqData.length > 0 ? eqData[eqData.length-1].time : 0;
+      if (t > last) { eqData.push({time: t, value: cumR}); }
+      else { eqData[eqData.length-1] = {time: last, value: cumR}; }
       eqSeries.setData(eqData);
     } else if (msg.type === 'position') {
       updatePosition(msg.data);

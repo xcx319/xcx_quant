@@ -56,8 +56,9 @@ BAR_WINDOW = 500
 # --- Risk ---
 LEVERAGE = 1
 MAX_POSITIONS = 1
-INITIAL_CAPITAL = 100   # total initial capital in USD
-RISK_PER_TRADE = 0.20   # fraction of capital per trade (20%)
+TRADE_NOTIONAL = 100      # nominal notional for risk calc (max loss = notional * R)
+RISK_PER_TRADE = 0.08     # fraction of notional risked per trade
+MAX_CAPITAL = 200          # max available margin in USD (actual account balance)
 DAILY_LOSS_LIMIT_R = -5.0  # stop trading after cumulative daily loss exceeds this (in R-multiples)
 MAX_TRADES_PER_DAY = 10    # max trades per calendar day
 
