@@ -39,6 +39,7 @@ TP_MULT: float = float(BEST["tp"])
 SL_MULT: float = float(BEST["sl"])
 THRESHOLD: float = float(BEST["threshold"])
 LABEL_MODE: str = BEST.get("label_mode", "first_touch")
+LONG_ONLY: bool = BEST.get("long_only", False)
 
 MODEL_PATH = str(PROJECT_ROOT / "model_sniper_v3_first_touch.json")
 

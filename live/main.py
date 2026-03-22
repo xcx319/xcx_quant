@@ -125,6 +125,11 @@ async def _process_bar(bar: dict):
     scanner_score = trigger["scanner_score"]
     scanner_trigger_ts = time.time()
 
+    # Long-only mode: skip short signals
+    if config.LONG_ONLY and event_dir != 1:
+        logger.info("Short signal skipped (long_only=True)")
+        return
+
     # Delay model inference: wait POST_WINDOW_S seconds to collect tick data
     # for event-aligned features, then run model + trade in background
     bar_start_ns = int(bar["datetime"].timestamp() * 1e9) if isinstance(bar["datetime"], datetime) else int(time.time() * 1e9)

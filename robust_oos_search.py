@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-window", type=int, default=3)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--output", default="robust_oos_search_results.csv")
+    parser.add_argument("--long-only", action="store_true", help="Only use long (event_dir==1) signals.")
     return parser.parse_args()
 
 
@@ -336,6 +337,10 @@ def main() -> None:
     if "event_dir" not in df.columns:
         df["event_dir"] = -1
 
+    if args.long_only:
+        df = df[df["event_dir"] == 1].copy()
+        print(f"Long-only filter: {len(df)} rows remaining")
+
     df = add_directional_features(df)
     features = [feature for feature in BASE_FEATURES if feature in df.columns]
     if len(features) < 6:
@@ -493,6 +498,7 @@ def main() -> None:
         "scanner_name": str(best["scanner_name"]),
         "scanner_variant": str(best["scanner_variant"]),
         "model_type": old_cfg.get("model_type", "xgb"),
+        "long_only": args.long_only,
         "min_valid_trades": args.min_valid_trades,
         "threshold_smooth_window": args.smooth_window,
         "profitable_fold_ratio": float(best["profitable_fold_ratio"]),

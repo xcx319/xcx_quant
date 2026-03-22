@@ -44,6 +44,7 @@ CONFIG = {
     "plot_dir": "./plots",
     "min_valid_trades": int(BEST.get("min_valid_trades", 80)),
     "threshold_smooth_window": int(BEST.get("threshold_smooth_window", 3)),
+    "long_only": bool(BEST.get("long_only", False)),
 }
 
 os.makedirs(CONFIG["plot_dir"], exist_ok=True)
@@ -64,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--live", action="store_true", help="Live mode: use all data for train+valid (no test holdout), select threshold from validation, update best_config.json.")
     parser.add_argument("--dynamic-tpsl", action="store_true", help="Enable dynamic TP/SL scaling based on vol_regime.")
     parser.add_argument("--breakeven", action="store_true", help="Enable breakeven stop (move SL to entry after 1.0R, lock 0.5R after 1.5R).")
+    parser.add_argument("--long-only", action="store_true", default=CONFIG["long_only"], help="Only train on long (event_dir==1) signals.")
     return parser.parse_args()
 
 
@@ -84,7 +86,7 @@ def filter_by_scanner(df: pd.DataFrame, scanner_arg: str, scanner_variant_arg: s
     return out.copy()
 
 
-def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_mode: str, same_bar_policy: str, horizon: int, tp_mult: float, sl_mult: float, dynamic_tpsl: bool = False, breakeven: bool = False) -> pd.DataFrame:
+def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_mode: str, same_bar_policy: str, horizon: int, tp_mult: float, sl_mult: float, dynamic_tpsl: bool = False, breakeven: bool = False, long_only: bool = False) -> pd.DataFrame:
     print(f"Loading data... label_mode={label_mode}, horizon={horizon}m")
     print(f"Scanner filter... scanner={scanner_arg}, variant={scanner_variant_arg}")
     try:
@@ -100,6 +102,13 @@ def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_
     if df.empty:
         print(f"No rows left after scanner filter: scanner={scanner_arg}, variant={scanner_variant_arg}")
         return df
+
+    if long_only:
+        df = df[df["event_dir"] == 1].copy()
+        print(f"Long-only filter: {len(df)} rows remaining")
+        if df.empty:
+            print("No long signals found.")
+            return df
 
     df = add_directional_features(df)
     cache = build_labeling_cache(df)
@@ -829,6 +838,7 @@ if __name__ == "__main__":
         sl_mult=CONFIG["sl_mult"],
         dynamic_tpsl=args.dynamic_tpsl,
         breakeven=args.breakeven,
+        long_only=args.long_only,
     )
 
     if not df.empty:
