@@ -791,8 +791,20 @@ function connectWS() {
       if (msg.data.signals) msg.data.signals.slice(-20).forEach(addSignal);
       if (msg.data.trades) {
         msg.data.trades.slice(-20).forEach(addTrade);
-        msg.data.trades.forEach(t => { if (t.pnl != null) cumR += Number(t.pnl); });
-        if (cumR !== 0) { eqData.push({time: toBJ(Math.floor(Date.now()/1000)), value: cumR}); eqSeries.setData(eqData); }
+        // Build historical equity curve from closed trades
+        const closedTrades = msg.data.trades
+          .filter(t => t.pnl != null && t.close_time)
+          .sort((a, b) => Number(a.close_time) - Number(b.close_time));
+        cumR = 0;
+        closedTrades.forEach(t => {
+          cumR += Number(t.pnl);
+          eqData.push({time: toBJ(Math.floor(Number(t.close_time))), value: cumR});
+        });
+        // Also count trades without close_time but with pnl
+        msg.data.trades.filter(t => t.pnl != null && !t.close_time).forEach(t => {
+          cumR += Number(t.pnl);
+        });
+        if (eqData.length > 0) eqSeries.setData(eqData);
       }
       if (msg.data.health) updateHealth(msg.data.health);
       if (msg.data.scanner_state) updateScannerState(msg.data.scanner_state);

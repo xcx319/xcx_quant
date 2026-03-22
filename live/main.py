@@ -905,7 +905,7 @@ async def websocket_endpoint(ws: WebSocket):
             "data": {
                 "bars": bars,
                 "signals": state.signals[-50:],
-                "trades": state.trades[-50:],
+                "trades": state.trades,
                 "health": state.snapshot(),
                 "scanner_state": state.last_scanner_state,
                 "account": state.last_account,
