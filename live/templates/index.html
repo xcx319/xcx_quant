@@ -431,7 +431,7 @@ const eqChart = LightweightCharts.createChart(document.getElementById('eq-contai
   layout:{background:{color:'#111827'},textColor:'#94a3b8'},
   grid:{vertLines:{color:'#1e293b'},horzLines:{color:'#1e293b'}},
   timeScale:{timeVisible:true},rightPriceScale:{borderColor:'#1e293b'},
-  localization:{timeFormatter:t=>{const d=new Date((t-BJOffset)*1000);return d.toISOString().slice(11,19);}},
+  localization:{timeFormatter:t=>{const d=new Date((t-BJOffset)*1000);return d.toISOString().slice(5,16).replace('T',' ');}},
 });
 const eqSeries = eqChart.addLineSeries({color:'#3b82f6',lineWidth:2});
 let cumR = 0;
@@ -804,7 +804,7 @@ function connectWS() {
         msg.data.trades.filter(t => t.pnl != null && !t.close_time).forEach(t => {
           cumR += Number(t.pnl);
         });
-        if (eqData.length > 0) eqSeries.setData(eqData);
+        if (eqData.length > 0) { eqSeries.setData(eqData); eqChart.timeScale().fitContent(); }
       }
       if (msg.data.health) updateHealth(msg.data.health);
       if (msg.data.scanner_state) updateScannerState(msg.data.scanner_state);
