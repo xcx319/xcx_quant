@@ -796,6 +796,11 @@ function connectWS() {
           .filter(t => t.pnl != null && t.close_time)
           .sort((a, b) => Number(a.close_time) - Number(b.close_time));
         cumR = 0;
+        if (closedTrades.length > 0) {
+          // Start from zero at the open time of the first trade
+          const firstOpenTs = closedTrades[0].open_ts || closedTrades[0].ts;
+          if (firstOpenTs) eqData.push({time: toBJ(Math.floor(Number(firstOpenTs))), value: 0});
+        }
         closedTrades.forEach(t => {
           cumR += Number(t.pnl);
           eqData.push({time: toBJ(Math.floor(Number(t.close_time))), value: cumR});
