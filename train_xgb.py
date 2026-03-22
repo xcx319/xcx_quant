@@ -241,6 +241,7 @@ def train_final_model(df: pd.DataFrame):
     model.fit(**fit_kwargs)
 
     model.get_booster().save_model(CONFIG["model_out"])
+    model.get_booster().save_model("model_xgb.json")
 
     print("\nFeature Importance (top 20):")
     fi = pd.Series(model.feature_importances_, index=available_feats).sort_values(ascending=False)
@@ -332,7 +333,8 @@ def train_live_model(df: pd.DataFrame):
     model.fit(**fit_kwargs)
 
     model.get_booster().save_model(CONFIG["model_out"])
-    print(f"\nModel saved to {CONFIG['model_out']}")
+    model.get_booster().save_model("model_xgb.json")
+    print(f"\nModel saved to {CONFIG['model_out']} + model_xgb.json")
 
     print("\nFeature Importance (top 20):")
     fi = pd.Series(model.feature_importances_, index=available_feats).sort_values(ascending=False)
