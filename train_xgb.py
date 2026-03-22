@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve
+from sklearn.inspection import permutation_importance
 
 from quant_modeling import (
     BASE_FEATURES,
@@ -31,16 +32,18 @@ PURGE_GAP_BARS = 30
 
 CONFIG = {
     "data_path": "dataset_enhanced.parquet",
+    "scanner": str(BEST.get("scanner_name", "all")),
+    "scanner_variant": str(BEST.get("scanner_variant", "all")),
     "horizon": int(BEST["h"]),
     "tp_mult": float(BEST["tp"]),
     "sl_mult": float(BEST["sl"]),
-    "label_mode": "first_touch",
-    "same_bar_policy": "drop",
+    "label_mode": str(BEST.get("label_mode", "first_touch")),
+    "same_bar_policy": str(BEST.get("same_bar_policy", "drop")),
     "features": list(BASE_FEATURES),
     "model_out": "model_sniper_v3.json",
     "plot_dir": "./plots",
-    "min_valid_trades": 80,
-    "threshold_smooth_window": 3,
+    "min_valid_trades": int(BEST.get("min_valid_trades", 80)),
+    "threshold_smooth_window": int(BEST.get("threshold_smooth_window", 3)),
 }
 
 os.makedirs(CONFIG["plot_dir"], exist_ok=True)
@@ -49,8 +52,8 @@ os.makedirs(CONFIG["plot_dir"], exist_ok=True)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", default=CONFIG["data_path"])
-    parser.add_argument("--scanner", default="all", help="Filter scanner_name by one or more comma-separated names.")
-    parser.add_argument("--scanner-variant", default="all", help="Filter exact scanner_variant by one or more comma-separated values.")
+    parser.add_argument("--scanner", default=CONFIG["scanner"], help="Filter scanner_name by one or more comma-separated names.")
+    parser.add_argument("--scanner-variant", default=CONFIG["scanner_variant"], help="Filter exact scanner_variant by one or more comma-separated values.")
     parser.add_argument("--label-mode", choices=["window_tp", "first_touch"], default=CONFIG["label_mode"])
     parser.add_argument("--same-bar-policy", choices=["drop", "neutral", "tp_first", "sl_first"], default=CONFIG["same_bar_policy"])
     parser.add_argument("--horizon", type=int, default=CONFIG["horizon"])
@@ -58,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sl-mult", type=float, default=CONFIG["sl_mult"])
     parser.add_argument("--min-valid-trades", type=int, default=CONFIG["min_valid_trades"])
     parser.add_argument("--threshold-smooth-window", type=int, default=CONFIG["threshold_smooth_window"])
+    parser.add_argument("--live", action="store_true", help="Live mode: use all data for train+valid (no test holdout), select threshold from validation, update best_config.json.")
+    parser.add_argument("--dynamic-tpsl", action="store_true", help="Enable dynamic TP/SL scaling based on vol_regime.")
+    parser.add_argument("--breakeven", action="store_true", help="Enable breakeven stop (move SL to entry after 1.0R, lock 0.5R after 1.5R).")
     return parser.parse_args()
 
 
@@ -78,8 +84,9 @@ def filter_by_scanner(df: pd.DataFrame, scanner_arg: str, scanner_variant_arg: s
     return out.copy()
 
 
-def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_mode: str, same_bar_policy: str, horizon: int, tp_mult: float, sl_mult: float) -> pd.DataFrame:
+def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_mode: str, same_bar_policy: str, horizon: int, tp_mult: float, sl_mult: float, dynamic_tpsl: bool = False, breakeven: bool = False) -> pd.DataFrame:
     print(f"Loading data... label_mode={label_mode}, horizon={horizon}m")
+    print(f"Scanner filter... scanner={scanner_arg}, variant={scanner_variant_arg}")
     try:
         df = pd.read_parquet(path)
     except FileNotFoundError:
@@ -103,6 +110,7 @@ def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_
         sl_mult=sl_mult,
         label_mode=label_mode,
         same_bar_policy=same_bar_policy,
+        dynamic_tpsl=dynamic_tpsl,
     )
 
     df["label"] = label_info["label"]
@@ -110,6 +118,10 @@ def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_
     df["hit_tp"] = label_info["hit_tp"]
     df["hit_sl"] = label_info["hit_sl"]
     df["ambiguous_same_bar"] = label_info["ambiguous"]
+
+    be_trigger = 1.0 if breakeven else 0.0
+    lp_trigger = 1.5 if breakeven else 0.0
+    lp_level = 0.5 if breakeven else 0.0
     df["realized_pnl_r"] = build_realized_pnl(
         cache=cache,
         horizon=horizon,
@@ -117,6 +129,10 @@ def load_and_label(path: str, scanner_arg: str, scanner_variant_arg: str, label_
         sl_mult=sl_mult,
         label_mode=label_mode,
         same_bar_policy=same_bar_policy,
+        breakeven_trigger_r=be_trigger,
+        lock_profit_trigger_r=lp_trigger,
+        lock_profit_level_r=lp_level,
+        dynamic_tpsl=dynamic_tpsl,
     )
 
     dropped = int((~df["label_valid"]).sum())
@@ -197,12 +213,12 @@ def train_final_model(df: pd.DataFrame):
     model = xgb.XGBClassifier(
         n_estimators=1500,
         max_depth=4,
-        learning_rate=0.005,
-        subsample=0.65,
-        colsample_bytree=0.5,
+        learning_rate=0.003,
+        subsample=0.5,
+        colsample_bytree=0.7,
         colsample_bylevel=0.7,
         gamma=0.5,
-        min_child_weight=20,
+        min_child_weight=50,
         reg_alpha=0.5,
         reg_lambda=2.0,
         max_delta_step=1,
@@ -225,6 +241,20 @@ def train_final_model(df: pd.DataFrame):
     if zero_imp:
         print(f"\nZero-importance features (consider removing): {zero_imp}")
 
+    # Permutation importance on validation set
+    if len(X_valid) > 0 and y_valid.nunique() > 1:
+        print("\nPermutation Importance (validation set, 5 repeats)...")
+        perm_result = permutation_importance(
+            model, X_valid, y_valid, n_repeats=5,
+            scoring="average_precision", random_state=42, n_jobs=-1,
+        )
+        perm_fi = pd.Series(perm_result.importances_mean, index=available_feats).sort_values(ascending=False)
+        print("Top 20 by permutation importance:")
+        print(perm_fi.head(20))
+        negative_perm = perm_fi[perm_fi < 0].index.tolist()
+        if negative_perm:
+            print(f"\nNegative permutation importance (hurting OOS, consider removing): {negative_perm}")
+
     split_data = {
         "X_valid": X_valid,
         "y_valid": y_valid,
@@ -234,6 +264,112 @@ def train_final_model(df: pd.DataFrame):
         "df_test": df.iloc[test_start:].copy(),
     }
     return model, split_data
+
+
+def train_live_model(df: pd.DataFrame):
+    """Train model for live trading: 85% train + 15% valid (early stopping only), no test holdout."""
+    available_feats = [feature for feature in CONFIG["features"] if feature in df.columns]
+    missing = sorted(set(CONFIG["features"]) - set(available_feats))
+    if missing:
+        print(f"Warning: Missing features (will skip): {missing}")
+
+    X = df[available_feats].astype(np.float32)
+    y = df["label"]
+    w = df["sample_weight"]
+
+    train_end = int(len(df) * 0.85)
+    valid_start = train_end + PURGE_GAP_BARS
+
+    X_train = X.iloc[:train_end]
+    y_train = y.iloc[:train_end]
+    w_train = w.iloc[:train_end]
+
+    X_valid = X.iloc[valid_start:]
+    y_valid = y.iloc[valid_start:]
+
+    print(f"\n[LIVE MODE] Train: {len(X_train)}, Valid: {len(X_valid)} (purge gap={PURGE_GAP_BARS}), Test: 0")
+    print(f"Train label dist: {y_train.value_counts().to_dict()}")
+    print(f"Valid label dist: {y_valid.value_counts().to_dict()}")
+
+    fit_kwargs = {
+        "X": X_train,
+        "y": y_train,
+        "sample_weight": w_train,
+        "verbose": 50,
+    }
+    early_stopping_rounds = 120 if len(X_valid) > 0 and y_valid.nunique() > 1 else None
+    if early_stopping_rounds is not None:
+        fit_kwargs["eval_set"] = [(X_train, y_train), (X_valid, y_valid)]
+
+    model = xgb.XGBClassifier(
+        n_estimators=1500,
+        max_depth=4,
+        learning_rate=0.003,
+        subsample=0.5,
+        colsample_bytree=0.7,
+        colsample_bylevel=0.7,
+        gamma=0.5,
+        min_child_weight=50,
+        reg_alpha=0.5,
+        reg_lambda=2.0,
+        max_delta_step=1,
+        objective="binary:logistic",
+        eval_metric="aucpr",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    model.fit(**fit_kwargs)
+
+    model.get_booster().save_model(CONFIG["model_out"])
+    print(f"\nModel saved to {CONFIG['model_out']}")
+
+    print("\nFeature Importance (top 20):")
+    fi = pd.Series(model.feature_importances_, index=available_feats).sort_values(ascending=False)
+    print(fi.head(20))
+
+    # Select threshold from validation set
+    valid_probs = model.predict_proba(X_valid)[:, 1]
+    summarize_scores("Valid", valid_probs)
+
+    tp_r = CONFIG["tp_mult"]
+    sl_r = CONFIG["sl_mult"]
+    realized_pnl_valid = None
+    df_valid = df.iloc[valid_start:].copy()
+    if "realized_pnl_r" in df_valid.columns:
+        realized_pnl_valid = df_valid["realized_pnl_r"].to_numpy(dtype=np.float64, copy=False)
+
+    thresholds = build_threshold_grid(valid_probs)
+    valid_df = evaluate_thresholds(valid_probs, y_valid, realized_pnl_valid, tp_r, sl_r, thresholds)
+    print_threshold_context("Validation", valid_df)
+
+    picked = select_threshold(
+        valid_df,
+        min_valid_trades=CONFIG["min_valid_trades"],
+        smooth_window=CONFIG["threshold_smooth_window"],
+    )
+    if picked is not None:
+        best_threshold = float(picked["threshold"])
+        print(f"\nSelected threshold: {best_threshold:.4f}")
+        print(f"  Trades: {int(picked['trades'])}, Win Rate: {picked['win_rate']:.2%}, "
+              f"Net Profit: {picked['net_profit_r']:.1f} R, Avg R: {picked['avg_r']:.2f}")
+    else:
+        best_threshold = float(valid_df.loc[valid_df["net_profit_r"].idxmax(), "threshold"])
+        print(f"\nFallback threshold (max profit): {best_threshold:.4f}")
+
+    # Update best_config.json with new threshold
+    try:
+        with open("best_config.json", "r") as f:
+            cfg = json.load(f)
+        cfg["threshold"] = best_threshold
+        with open("best_config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"Updated best_config.json threshold -> {best_threshold:.4f}")
+    except Exception as e:
+        print(f"Warning: could not update best_config.json: {e}")
+
+    return model
 
 
 def build_threshold_grid(probs: np.ndarray) -> np.ndarray:
@@ -691,10 +827,15 @@ if __name__ == "__main__":
         horizon=CONFIG["horizon"],
         tp_mult=CONFIG["tp_mult"],
         sl_mult=CONFIG["sl_mult"],
+        dynamic_tpsl=args.dynamic_tpsl,
+        breakeven=args.breakeven,
     )
 
     if not df.empty:
         available = [feature for feature in CONFIG["features"] if feature in df.columns]
         df = df.dropna(subset=available).copy()
-        model, split_data = train_final_model(df)
-        evaluate_strategy(model, split_data)
+        if args.live:
+            train_live_model(df)
+        else:
+            model, split_data = train_final_model(df)
+            evaluate_strategy(model, split_data)

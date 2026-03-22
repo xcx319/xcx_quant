@@ -528,6 +528,71 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         df['time_sin'] = np.sin(2 * np.pi * minute_idx / 1440.0)
         df['time_cos'] = np.cos(2 * np.pi * minute_idx / 1440.0)
 
+    # --- Cross-timeframe features (5m / 15m) ---
+    if isinstance(df.index, pd.DatetimeIndex):
+        close_5m = c.resample('5min').last().reindex(c.index, method='ffill')
+        high_5m = h.resample('5min').max().reindex(c.index, method='ffill')
+        low_5m = l.resample('5min').min().reindex(c.index, method='ffill')
+        close_15m = c.resample('15min').last().reindex(c.index, method='ffill')
+
+        rsi_5m = ta.rsi(close_5m, length=7)
+        df['rsi_7_5m'] = rsi_5m
+
+        range_5m_hi = high_5m.rolling(20).max()
+        range_5m_lo = low_5m.rolling(20).min()
+        df['range_pos_20_5m'] = _safe_ratio(close_5m - range_5m_lo, range_5m_hi - range_5m_lo)
+
+        ema20_15m = ta.ema(close_15m, length=20)
+        ema50_15m = ta.ema(close_15m, length=50)
+        df['ema_trend_15m'] = (ema20_15m > ema50_15m).astype(int) * 2 - 1
+
+        ema_trend_1m = df.get('ema_trend', pd.Series(0, index=df.index))
+        ema20_5m = ta.ema(close_5m, length=20)
+        ema50_5m = ta.ema(close_5m, length=50)
+        ema_trend_5m = (ema20_5m > ema50_5m).astype(int) * 2 - 1
+        df['tf_alignment'] = (ema_trend_1m + ema_trend_5m + df['ema_trend_15m']) / 3.0
+
+        ret_5_1m = c.pct_change(5)
+        ret_1_5m = close_5m.pct_change(1)
+        df['momentum_divergence_5m'] = ret_5_1m - ret_1_5m
+    else:
+        for col in ['rsi_7_5m', 'range_pos_20_5m', 'ema_trend_15m', 'tf_alignment', 'momentum_divergence_5m']:
+            df[col] = np.nan
+
+    # --- Order flow dynamics ---
+    if 'obi' in df.columns:
+        df['obi_momentum_3'] = df['obi'].diff(3)
+    else:
+        df['obi_momentum_3'] = np.nan
+
+    if 'ob_depth_bid_5' in df.columns and 'ob_depth_ask_5' in df.columns:
+        total_depth = df['ob_depth_bid_5'] + df['ob_depth_ask_5']
+        df['depth_absorption_rate'] = _safe_ratio(v, total_depth)
+        df['depth_divergence'] = df['ob_depth_bid_5'].pct_change(3) - df['ob_depth_ask_5'].pct_change(3)
+    else:
+        df['depth_absorption_rate'] = np.nan
+        df['depth_divergence'] = np.nan
+
+    if 'net_taker_vol_ratio' in df.columns:
+        df['flow_persistence_5'] = df['net_taker_vol_ratio'].rolling(5).apply(
+            lambda x: x.autocorr() if len(x) > 2 else 0, raw=False
+        )
+    else:
+        df['flow_persistence_5'] = np.nan
+
+    # --- Liquidity stress ---
+    if 'ob_spread_bps' in df.columns:
+        df['spread_vol_10'] = df['ob_spread_bps'].rolling(10).std()
+    else:
+        df['spread_vol_10'] = np.nan
+
+    if 'ob_quote_count' in df.columns:
+        df['quote_intensity_change'] = df['ob_quote_count'].pct_change(5)
+    else:
+        df['quote_intensity_change'] = np.nan
+
+    df['price_impact'] = _safe_ratio(df['ret_1'].abs(), np.log1p(v.clip(lower=0.0)))
+
     return df
 
 
@@ -850,11 +915,16 @@ def add_event_aligned_features(
     """
     if events.empty: return events
     if df_trades.empty:
-        out = pd.DataFrame(index=events.index)
+        result = events.copy()
         for col in ['sec_in_bar', 'sec_frac', 'event_return', 'event_effort_vs_result', 'event_rejection_strength']:
-            out[col] = 0.0
-        out['time_to_reject_s'] = float(post_window_s)
-        return events.join(out, how='left')
+            result[col] = 0.0
+        result['time_to_reject_s'] = float(post_window_s)
+        result['entry_price_delayed'] = result['close']  # fallback to close
+        result['entry_time_ns'] = np.nan
+        result['partial_bar_high'] = np.nan
+        result['partial_bar_low'] = np.nan
+        result['partial_bar_close'] = np.nan
+        return result
 
     # 1. 统一时间戳为 int64 nanoseconds
     if 'datetime' in df_trades.columns:
@@ -882,9 +952,14 @@ def add_event_aligned_features(
     trigger_arr = events['trigger_source'].astype(str).to_numpy() if 'trigger_source' in events.columns else np.array(['bar_close'] * len(events), dtype=object)
     atr_arr = events['atr'].to_numpy(dtype='float64') if 'atr' in events.columns else np.zeros(len(events), dtype='float64')
 
-    out = np.zeros((len(events), 6), dtype='float64')
+    out = np.zeros((len(events), 11), dtype='float64')
     # 默认拒绝时间为窗口最大值
     out[:, 5] = float(post_window_s)
+    out[:, 6] = np.nan  # entry_price_delayed: default NaN (fallback to close)
+    out[:, 7] = np.nan  # entry_time_ns
+    out[:, 8] = np.nan  # partial_bar_high
+    out[:, 9] = np.nan  # partial_bar_low
+    out[:, 10] = np.nan  # partial_bar_close
 
 # === [诊断准备] 新增一个数组记录原因 ===
     # 0=Normal, 1=Fallback(Mismatch), 2=Collision(Same Time)
@@ -926,6 +1001,8 @@ def add_event_aligned_features(
             t0_ns = t_ns[t0_pos]
             break_price = price[t0_pos]
 
+        out[i, 6] = break_price  # fallback entry_price_delayed = break_price (bar close)
+
         sec_in_bar = (t0_ns - bar_start_ns) / 1e9
         out[i, 0] = sec_in_bar
         out[i, 1] = sec_in_bar / 60.0
@@ -947,6 +1024,24 @@ def add_event_aligned_features(
         if len(p_w) == 0: continue
 
         price_end = float(p_w[-1])
+        out[i, 6] = price_end  # entry_price_delayed = last tick in post-window
+
+        # --- Partial bar correction for forward path step 1 ---
+        entry_tick_idx = k1 - 1
+        entry_ns = t_ns[entry_tick_idx]
+        out[i, 7] = float(entry_ns)  # entry_time_ns
+
+        # Partial bar: [entry_time, next_bar_end)
+        # next_bar_end = bar_start + 2 * 60s = end of the first future bar
+        next_bar_end_ns = bar_start_ns + 2 * one_min_ns
+        m0 = np.searchsorted(t_ns, entry_ns, side='left')
+        m1 = np.searchsorted(t_ns, next_bar_end_ns, side='left')
+        if m0 < m1:
+            p_partial = price[m0:m1]
+            out[i, 8] = p_partial.max()    # partial_bar_high
+            out[i, 9] = p_partial.min()    # partial_bar_low
+            out[i, 10] = float(p_partial[-1])  # partial_bar_close
+
         vol_w = float(s_w.sum())
         max_p = float(p_w.max())
         min_p = float(p_w.min())
@@ -993,12 +1088,16 @@ def add_event_aligned_features(
             # 保持默认值 (post_window_s)
             pass
 
-    out_df = pd.DataFrame(
-        out, index=events.index,
-        columns=['sec_in_bar', 'sec_frac', 'event_return', 'event_effort_vs_result', 'event_rejection_strength', 'time_to_reject_s']
+    new_cols = pd.DataFrame(
+        out,
+        columns=['sec_in_bar', 'sec_frac', 'event_return', 'event_effort_vs_result', 'event_rejection_strength', 'time_to_reject_s', 'entry_price_delayed', 'entry_time_ns', 'partial_bar_high', 'partial_bar_low', 'partial_bar_close'],
     )
-    out_df['diagnosis_code'] = diag_arr
-    return events.join(out_df, how='left')
+    new_cols['diagnosis_code'] = diag_arr
+    # Align by position (not by index) to avoid cartesian product on duplicate DatetimeIndex
+    result = events.reset_index(drop=False)
+    for col in new_cols.columns:
+        result[col] = new_cols[col].values
+    return result.set_index('datetime')
 
 # ==========================================
 # 3. 预计算未来结果

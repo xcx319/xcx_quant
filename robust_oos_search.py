@@ -131,12 +131,12 @@ def fit_fold_model(X_train: pd.DataFrame, y_train: pd.Series, X_valid: pd.DataFr
     model = xgb.XGBClassifier(
         n_estimators=1500,
         max_depth=4,
-        learning_rate=0.005,
-        subsample=0.65,
-        colsample_bytree=0.5,
+        learning_rate=0.003,
+        subsample=0.5,
+        colsample_bytree=0.7,
         colsample_bylevel=0.7,
         gamma=0.5,
-        min_child_weight=20,
+        min_child_weight=50,
         reg_alpha=0.5,
         reg_lambda=2.0,
         max_delta_step=1,
@@ -454,26 +454,67 @@ def main() -> None:
     result_df.to_csv(args.output, index=False)
 
     print(f"Evaluated {candidate_count} robust candidates. Saved to {args.output}")
+    display_cols = [
+        "scanner_name",
+        "events",
+        "h",
+        "tp",
+        "sl",
+        "folds_used",
+        "profitable_fold_ratio",
+        "total_test_trades",
+        "total_test_net_profit_r",
+        "avg_r_per_trade",
+        "test_ap_mean",
+        "median_threshold",
+        "threshold_std",
+    ]
     print(
-        result_df.head(args.top_k).loc[
-            :,
-            [
-                "scanner_name",
-                "events",
-                "h",
-                "tp",
-                "sl",
-                "folds_used",
-                "profitable_fold_ratio",
-                "total_test_trades",
-                "total_test_net_profit_r",
-                "avg_r_per_trade",
-                "test_ap_mean",
-                "median_threshold",
-                "threshold_std",
-            ],
-        ].to_string(index=False, float_format=lambda x: f"{x:.4f}")
+        result_df.head(args.top_k).loc[:, display_cols]
+        .to_string(index=False, float_format=lambda x: f"{x:.4f}")
     )
+
+    # --- Auto-update best_config.json with top-1 result ---
+    best = result_df.iloc[0]
+    config_path = "best_config.json"
+    try:
+        with open(config_path, "r") as f:
+            old_cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        old_cfg = {}
+
+    new_cfg = {
+        "h": int(best["h"]),
+        "tp": float(best["tp"]),
+        "sl": float(best["sl"]),
+        "threshold": float(best["median_threshold"]),
+        "label_mode": str(best["label_mode"]),
+        "same_bar_policy": str(best["same_bar_policy"]),
+        "scanner_name": str(best["scanner_name"]),
+        "scanner_variant": str(best["scanner_variant"]),
+        "model_type": old_cfg.get("model_type", "xgb"),
+        "min_valid_trades": args.min_valid_trades,
+        "threshold_smooth_window": args.smooth_window,
+        "profitable_fold_ratio": float(best["profitable_fold_ratio"]),
+        "total_test_trades": int(best["total_test_trades"]),
+        "total_test_net_profit_r": float(best["total_test_net_profit_r"]),
+        "avg_r_per_trade": float(best["avg_r_per_trade"]),
+        "ap": float(best["test_ap_mean"]),
+    }
+
+    changed = any(old_cfg.get(k) != new_cfg.get(k) for k in ["h", "tp", "sl", "scanner_variant", "threshold"])
+    with open(config_path, "w") as f:
+        json.dump(new_cfg, f, indent=2)
+        f.write("\n")
+
+    if changed:
+        print(f"\n[UPDATE] best_config.json updated: h={new_cfg['h']}, tp={new_cfg['tp']}, sl={new_cfg['sl']}, "
+              f"threshold={new_cfg['threshold']:.4f}, variant={new_cfg['scanner_variant']}")
+        if old_cfg:
+            print(f"  (was: h={old_cfg.get('h')}, tp={old_cfg.get('tp')}, sl={old_cfg.get('sl')}, "
+                  f"threshold={old_cfg.get('threshold')}, variant={old_cfg.get('scanner_variant')})")
+    else:
+        print(f"\n[OK] best_config.json unchanged (top-1 matches current config)")
 
 
 if __name__ == "__main__":
