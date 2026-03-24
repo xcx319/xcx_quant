@@ -1,19 +1,32 @@
 {
-  "h": 5,
-  "tp": 2.5,
+  "h": 10,
+  "tp": 3.0,
   "sl": 1.5,
-  "threshold": 0.54,
+  "threshold": 0.498,
   "label_mode": "first_touch",
   "same_bar_policy": "drop",
   "scanner_name": "flow_reversal",
-  "scanner_variant": "flow_reversal|flow_abs=0.05,obi_abs=0.0,range_hi=0.7,range_lo=0.35,spread_mult=1.0",
+  "scanner_variant": "flow_reversal|flow_abs=0.05,obi_abs=-1.0,range_hi=0.7,range_lo=0.35,spread_mult=0.0",
   "model_type": "xgb",
-  "long_only": true,
+  "long_only": false,
   "min_valid_trades": 80,
   "threshold_smooth_window": 3,
   "profitable_fold_ratio": 1.0,
-  "total_test_trades": 1356,
-  "total_test_net_profit_r": 688.7857320890237,
-  "avg_r_per_trade": 0.5079540797116694,
-  "ap": 0.7322158866886331
+  "total_test_trades": 10076,
+  "total_test_net_profit_r": 5919.518397913542,
+  "avg_r_per_trade": 0.5874869390545396,
+  "ap": 0.663904844303543,
+  "split_model": true,
+  "long_config": {
+    "h": 10,
+    "tp": 3.0,
+    "sl": 1.5,
+    "threshold": 0.4862
+  },
+  "short_config": {
+    "h": 10,
+    "tp": 3.0,
+    "sl": 1.5,
+    "threshold": 0.4725
+  }
 }

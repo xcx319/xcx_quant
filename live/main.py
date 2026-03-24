@@ -20,7 +20,7 @@ from .feature_engine import FeatureEngine
 from .scanner import FlowReversalScanner
 from .model_inference import ModelInference
 from .execution import OrderExecutor
-from .ws_client import OKXWebSocket, OKXPrivateWebSocket
+from .ws_client import GateWebSocket, GatePrivateWebSocket
 from .event_aligner import compute_event_features, POST_WINDOW_S
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
@@ -36,34 +36,27 @@ executor: OrderExecutor | None = None
 ws_clients: set[WebSocket] = set()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 _last_ob_broadcast: float = 0.0
-_live_bars_count: int = 0  # bars received from live data (not warmup)
-_ct_val: float = 0.01  # contract value, fetched on startup
-_lot_sz: float = 0.01  # lot size (min increment), fetched on startup
-_min_sz: float = 0.01  # minimum order size, fetched on startup
-_lever: int = 10  # leverage, fetched on startup
+_live_bars_count: int = 0
+_ct_val: float = 0.0001   # Gate ETH_USDT quanto_multiplier (fetched on startup)
+_lot_sz: float = 1.0      # Gate uses integer contract sizes
+_min_sz: float = 1.0
+_lever: int = 10
 
 
-def _calc_position_size(price: float, atr: float, sl_mult: float) -> str:
+def _calc_position_size(price: float, atr: float, sl_mult: float) -> int:
     """Risk-based position sizing with auto-leverage.
-
-    max_loss = notional * R
-    contracts = max_loss / (sl_mult * atr * ctVal)
-    leverage  = ceil(contracts * ctVal * price / max_capital)
-
-    Returns contract count string for OKX API.
+    Gate.io uses integer contract sizes. Returns signed int (positive=long).
     """
     import math
     global _lever
     if price <= 0 or _ct_val <= 0 or atr <= 0 or sl_mult <= 0:
-        return str(_min_sz)
+        return int(_min_sz)
     max_loss = state.trade_notional * state.risk_per_trade
     loss_per_contract = sl_mult * atr * _ct_val
     contracts = max_loss / loss_per_contract
-    # Round down to lot size
-    contracts = int(contracts / _lot_sz) * _lot_sz
-    contracts = max(_min_sz, contracts)
+    contracts = max(int(_min_sz), int(contracts))
 
-    # Auto-adjust leverage so max_capital can cover the margin
+    # Auto-adjust leverage
     notional = contracts * _ct_val * price
     required_lever = max(1, math.ceil(notional / state.max_capital))
     if required_lever != _lever:
@@ -71,7 +64,7 @@ def _calc_position_size(price: float, atr: float, sl_mult: float) -> str:
                     f"(notional={notional:.1f}, max_capital={state.max_capital})")
         try:
             result = executor.set_leverage(required_lever)
-            if result.get("code") == "0":
+            if isinstance(result, dict) and not result.get("label"):
                 _lever = required_lever
                 state.leverage = _lever
             else:
@@ -79,8 +72,7 @@ def _calc_position_size(price: float, atr: float, sl_mult: float) -> str:
         except Exception as e:
             logger.warning(f"set_leverage error: {e}")
 
-    return f"{contracts:.2f}".rstrip('0').rstrip('.')
-
+    return contracts
 
 
 # --- Broadcast to dashboard clients ---
@@ -88,7 +80,7 @@ async def broadcast(event_type: str, data: dict):
     global ws_clients
     msg = json.dumps({"type": event_type, "data": data}, default=str)
     dead = set()
-    for ws in ws_clients:
+    for ws in list(ws_clients):
         try:
             await ws.send_text(msg)
         except Exception:
@@ -103,70 +95,66 @@ def on_bar_complete(bar: dict):
 
 async def _process_bar(bar: dict):
     global state, _live_bars_count
-    _live_bars_count += 1
-    # Merge orderbook features into bar
-    ob_feats = ob_state.get_features()
-    bar.update(ob_feats)
-    ob_state.reset_quote_count()
+    try:
+        _live_bars_count += 1
+        ob_feats = ob_state.get_features()
+        bar.update(ob_feats)
+        ob_state.reset_quote_count()
 
-    state.bars_received = engine.bar_count + 1
-    state.current_price = bar["close"]
-    state.last_bar_time = str(bar["datetime"])
-    state.recent_bars.append({
-        "time": int(bar["datetime"].timestamp()) if isinstance(bar["datetime"], datetime) else int(time.time()),
-        "open": bar["open"], "high": bar["high"], "low": bar["low"], "close": bar["close"],
-        "volume": bar.get("volume", 0),
-    })
+        state.bars_received = engine.bar_count + 1
+        state.current_price = bar["close"]
+        state.last_bar_time = str(bar["datetime"])
+        state.recent_bars.append({
+            "time": int(bar["datetime"].timestamp()) if isinstance(bar["datetime"], datetime) else int(time.time()),
+            "open": bar["open"], "high": bar["high"], "low": bar["low"], "close": bar["close"],
+            "volume": bar.get("volume", 0),
+        })
 
-    # Feature computation
-    feat_row = engine.add_bar(bar)
-    state.is_warm = engine.is_warm
+        feat_row = engine.add_bar(bar)
+        state.is_warm = engine.is_warm
 
-    await broadcast("price", state.recent_bars[-1])
-    await broadcast("health", state.snapshot())
+        await broadcast("price", state.recent_bars[-1])
+        await broadcast("health", state.snapshot())
 
-    if feat_row is None:
-        return  # still warming up
+        if feat_row is None:
+            return
 
-    state.current_atr = float(feat_row.get("atr", 0)) if np.isfinite(feat_row.get("atr", np.nan)) else 0.0
+        state.current_atr = float(feat_row.get("atr", 0)) if np.isfinite(feat_row.get("atr", np.nan)) else 0.0
 
-    # Scanner evaluation (detailed for dashboard)
-    scanner_result = scanner.evaluate_detailed(feat_row)
-    state.last_scanner_state = scanner_result
-    await broadcast("scanner_state", scanner_result)
+        scanner_result = scanner.evaluate_detailed(feat_row)
+        state.last_scanner_state = scanner_result
+        logger.info(f"Bar #{_live_bars_count}: atr={state.current_atr:.2f}, scanner L={scanner_result['long_met']}/6 S={scanner_result['short_met']}/6")
+        await broadcast("scanner_state", scanner_result)
 
-    trigger = scanner_result["trigger"]
-    if trigger is None:
-        return
+        trigger = scanner_result["trigger"]
+        if trigger is None:
+            return
 
-    # Guard: require 30+ live bars for spread_ref/OBI deques to stabilize
-    if _live_bars_count < 30:
-        logger.info(f"Scanner trigger ignored: only {_live_bars_count}/30 live bars (features not stable)")
-        return
+        if _live_bars_count < 30:
+            logger.info(f"Scanner trigger ignored: only {_live_bars_count}/30 live bars")
+            return
 
-    event_dir = trigger["event_dir"]
-    scanner_score = trigger["scanner_score"]
-    scanner_trigger_ts = time.time()
+        event_dir = trigger["event_dir"]
+        scanner_score = trigger["scanner_score"]
+        scanner_trigger_ts = time.time()
 
-    # Long-only mode: skip short signals
-    if config.LONG_ONLY and event_dir != 1:
-        logger.info("Short signal skipped (long_only=True)")
-        return
+        if config.LONG_ONLY and event_dir != 1:
+            logger.info("Short signal skipped (long_only=True)")
+            return
 
-    # Delay model inference: wait POST_WINDOW_S seconds to collect tick data
-    # for event-aligned features, then run model + trade in background
-    bar_start_ns = int(bar["datetime"].timestamp() * 1e9) if isinstance(bar["datetime"], datetime) else int(time.time() * 1e9)
-    logger.info(f"Scanner trigger: {'long' if event_dir == 1 else 'short'}, waiting {POST_WINDOW_S}s for event alignment...")
-    asyncio.get_event_loop().create_task(
-        _delayed_inference(feat_row, event_dir, scanner_score, bar, bar_start_ns, scanner_trigger_ts)
-    )
+        bar_start_ns = int(bar["datetime"].timestamp() * 1e9) if isinstance(bar["datetime"], datetime) else int(time.time() * 1e9)
+        logger.info(f"Scanner trigger: {'long' if event_dir == 1 else 'short'}, waiting {POST_WINDOW_S}s for event alignment...")
+        asyncio.get_event_loop().create_task(
+            _delayed_inference(feat_row, event_dir, scanner_score, bar, bar_start_ns, scanner_trigger_ts)
+        )
+    except Exception as e:
+        logger.error(f"_process_bar error: {e}", exc_info=True)
 
 
 async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar: dict, bar_start_ns: int, scanner_trigger_ts: float):
     """Wait for post_window ticks, compute event-aligned features, then run model."""
-    await asyncio.sleep(POST_WINDOW_S + 1)  # +1s buffer for tick arrival
+    await asyncio.sleep(POST_WINDOW_S + 1)
 
-    # Compute event-aligned features from tick buffer
     ev_feats = compute_event_features(
         tick_buffer=aggregator._tick_buffer,
         bar_start_ns=bar_start_ns,
@@ -179,7 +167,6 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
                 f"rejection={ev_feats['event_rejection_strength']:.4f}, "
                 f"time_to_reject={ev_feats['time_to_reject_s']:.2f}s")
 
-    # Model inference with real event-aligned features
     result = model.predict(feat_row, event_dir, scanner_score, event_features=ev_feats)
     model_inference_ts = time.time()
     signal_record = {
@@ -199,12 +186,10 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
     if not result["signal"]:
         return
 
-    # Check trading toggle
     if not state.trading_enabled:
         logger.info("Trading disabled, skipping order")
         return
 
-    # Check daily loss limit and max trades per day
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today_trades = [t for t in state.trades if str(t.get("time", "")).startswith(today_str)]
     if len(today_trades) >= state.daily_trade_limit:
@@ -218,63 +203,74 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
         logger.info(f"Daily loss limit hit ({today_pnl_r:.1f}R <= {state.daily_loss_limit_r}R), skipping")
         return
 
-    # Check position limit
     if state.open_position is not None:
         logger.info("Signal skipped: already in position")
         return
 
-    # Execute trade
     atr = state.current_atr
     if atr <= 0:
         logger.warning("ATR is zero, skipping trade")
         return
 
     entry = bar["close"]
-    # Use current market price (after ~16s delay) for TP/SL, matching backtest entry_price_delayed
     entry_for_tpsl = state.current_price if state.current_price else entry
+    if config.SPLIT_MODEL:
+        tp_mult = config.LONG_TP if event_dir == 1 else config.SHORT_TP
+        sl_mult = config.LONG_SL if event_dir == 1 else config.SHORT_SL
+    else:
+        tp_mult, sl_mult = config.TP_MULT, config.SL_MULT
     if event_dir == 1:  # long
-        tp_price = entry_for_tpsl + atr * config.TP_MULT
-        sl_price = entry_for_tpsl - atr * config.SL_MULT
-        side = "buy"
+        tp_price = entry_for_tpsl + atr * tp_mult
+        sl_price = entry_for_tpsl - atr * sl_mult
+        gate_size = _calc_position_size(entry_for_tpsl, atr, sl_mult)  # positive = long
     else:  # short
-        tp_price = entry_for_tpsl - atr * config.TP_MULT
-        sl_price = entry_for_tpsl + atr * config.SL_MULT
-        side = "sell"
+        tp_price = entry_for_tpsl - atr * tp_mult
+        sl_price = entry_for_tpsl + atr * sl_mult
+        gate_size = -_calc_position_size(entry_for_tpsl, atr, sl_mult)  # negative = short
 
     try:
-        size = _calc_position_size(entry_for_tpsl, atr, config.SL_MULT)
-        order_result = executor.place_market_order(side, size, tp_price, sl_price)
-        if order_result.get("code") == "0":
-            ord_id = order_result.get("data", [{}])[0].get("ordId", "")
+        order_result = executor.place_market_order(gate_size, tp_price, sl_price)
+        order_id = str(order_result.get("id", ""))
+        order_status = order_result.get("status", "")
+        if order_id and order_status not in ("error",):
             order_ts = time.time()
-            # Fetch fill details from OKX
-            fill_ts = None
             fill_px = None
+            fill_ts = None
             try:
-                detail = executor.get_order_detail(ord_id)
+                detail = executor.get_order_detail(order_id)
                 if detail:
-                    ft = detail.get("fillTime", "")
-                    if ft:
-                        fill_ts = int(ft) / 1000  # ms -> s
-                    fp = detail.get("fillPx", "")
-                    if fp:
+                    fp = detail.get("fill_price", "") or detail.get("price", "")
+                    if fp and float(fp) > 0:
                         fill_px = float(fp)
+                    ft = detail.get("finish_time", "") or detail.get("create_time", "")
+                    if ft:
+                        fill_ts = float(ft)
             except Exception as e:
                 logger.warning(f"Failed to fetch order detail: {e}")
-            # Recompute TP/SL based on actual fill price if available
+
             actual_entry = fill_px or entry_for_tpsl
             if fill_px:
                 if event_dir == 1:
-                    tp_price = actual_entry + atr * config.TP_MULT
-                    sl_price = actual_entry - atr * config.SL_MULT
+                    tp_price = actual_entry + atr * tp_mult
+                    sl_price = actual_entry - atr * sl_mult
                 else:
-                    tp_price = actual_entry - atr * config.TP_MULT
-                    sl_price = actual_entry + atr * config.SL_MULT
+                    tp_price = actual_entry - atr * tp_mult
+                    sl_price = actual_entry + atr * sl_mult
+
+            # Place TP/SL conditional orders
+            close_size = -gate_size  # opposite direction to close
+            try:
+                executor.place_tpsl(close_size, tp_price, sl_price)
+            except Exception as e:
+                logger.warning(f"Failed to place TP/SL orders: {e}")
+
+            side = "buy" if gate_size > 0 else "sell"
             state.open_position = {
                 "side": side, "entry": actual_entry, "tp": tp_price, "sl": sl_price,
-                "size": size, "time": state.last_bar_time,
+                "size": abs(gate_size), "gate_size": gate_size,
+                "time": state.last_bar_time,
                 "open_ts": time.time(),
-                "order_id": ord_id,
+                "order_id": order_id,
                 "atr": atr,
                 "max_fav_r": 0.0,
             }
@@ -290,31 +286,39 @@ async def _delayed_inference(feat_row, event_dir: int, scanner_score: float, bar
             state.trades.append(trade_record)
             append_log("trades", trade_record)
             await broadcast("trade", trade_record)
-            logger.info(f"Order placed: {side} @ {actual_entry:.2f}, TP={tp_price:.2f}, SL={sl_price:.2f}")
+            logger.info(f"Order placed: {side} {abs(gate_size)} @ {actual_entry:.2f}, TP={tp_price:.2f}, SL={sl_price:.2f}")
         else:
             logger.error(f"Order failed: {order_result}")
     except Exception as e:
         logger.error(f"Order execution error: {e}")
 
 
-# --- OKX message handlers ---
+# --- Gate.io message handlers ---
 _last_tick_broadcast: float = 0.0
 
+aggregator = BarAggregator(on_bar_complete=on_bar_complete)
+
+
 def on_trades_message(msg: dict):
+    """Handle Gate.io futures.trades update.
+    Gate format: {"channel": "futures.trades", "event": "update",
+                  "result": [{"contract": "ETH_USDT", "size": 10, "price": "3001.1",
+                               "id": 123, "create_time": 1234567890,
+                               "create_time_ms": 1234567890123}]}
+    size > 0 = buy (long aggressor), size < 0 = sell (short aggressor)
+    """
     global _last_tick_broadcast
     state.ws_trades_connected = True
-    for trade in msg.get("data", []):
-        px = float(trade["px"])
-        aggregator.ingest_trade(
-            price=px,
-            size=float(trade["sz"]),
-            side=trade["side"],
-            ts_ms=int(trade["ts"]),
-        )
+    for trade in msg.get("result", []):
+        raw_size = trade.get("size", 0)
+        px = float(trade["price"])
+        size = abs(float(raw_size))
+        side = "buy" if raw_size > 0 else "sell"
+        ts_ms = int(trade.get("create_time_ms", trade.get("create_time", 0) * 1000))
+        aggregator.ingest_trade(price=px, size=size, side=side, ts_ms=ts_ms)
         state.last_trade_ts = time.time()
-        prev_price = state.current_price
         state.current_price = px
-    # Throttled tick broadcast (max once per 500ms)
+
     now = time.time()
     if state.current_price and now - _last_tick_broadcast >= 0.5:
         _last_tick_broadcast = now
@@ -338,12 +342,18 @@ def on_trades_message(msg: dict):
 
 
 def on_books_message(msg: dict):
+    """Handle Gate.io futures.order_book update.
+    Gate format: {"channel": "futures.order_book", "event": "update",
+                  "result": {"t": 1234567890123, "contract": "ETH_USDT",
+                              "asks": [{"p": "3001.1", "s": 100}, ...],
+                              "bids": [{"p": "3000.9", "s": 200}, ...]}}
+    """
     global _last_ob_broadcast
     state.ws_books_connected = True
-    for snap in msg.get("data", []):
-        ob_state.update(snap)
+    result = msg.get("result", {})
+    if isinstance(result, dict):
+        ob_state.update(result)
         state.last_book_ts = time.time()
-    # Throttled orderbook broadcast (max once per 500ms)
     now = time.time()
     if now - _last_ob_broadcast >= 0.5:
         _last_ob_broadcast = now
@@ -354,69 +364,48 @@ def on_books_message(msg: dict):
             pass
 
 
-aggregator = BarAggregator(on_bar_complete=on_bar_complete)
-
-
-# --- Warmup from REST candles ---
-def warmup_from_candles():
-    logger.info("Warming up from REST candles...")
-    candles = executor.get_candles(bar="1m", limit=300)
-    if not candles:
-        logger.warning("No candles returned for warmup")
-        return
-    # OKX returns newest first, reverse to chronological
-    candles = list(reversed(candles))
-    for c in candles:
-        ts_ms = int(c[0])
-        bar = {
-            "datetime": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).replace(second=0, microsecond=0),
-            "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]),
-            "volume": float(c[5]),
-            "aggressor_ratio": 0.5, "net_taker_vol_ratio": 0.0,
-            "trade_gini": 0.0, "large_trade_vol_ratio": 0.0,
-            "trade_intensity": float(np.log1p(float(c[5]))),
-            "data_from_orderbook": 0,
-        }
-        engine.add_bar(bar)
-        state.recent_bars.append({
-            "time": int(bar["datetime"].timestamp()),
-            "open": bar["open"], "high": bar["high"], "low": bar["low"], "close": bar["close"],
-        })
-    state.bars_received = engine.bar_count
-    state.is_warm = engine.is_warm
-    state.current_price = float(candles[-1][4]) if candles else 0.0
-    logger.info(f"Warmup complete: {engine.bar_count} bars, is_warm={engine.is_warm}")
-
-
-# --- Private WebSocket handler (balance + positions, real-time push) ---
 def on_private_message(msg: dict):
-    """Handle balance_and_position and positions channel pushes."""
-    channel = msg.get("arg", {}).get("channel", "")
-    for d in msg.get("data", []):
-        if channel == "balance_and_position":
-            _handle_balance_and_position(d)
-        elif channel == "positions":
-            _handle_positions_push(d)
-        elif channel == "account":
-            _handle_account_push(d)
+    """Handle Gate.io private channel pushes (orders, positions, balances)."""
+    channel = msg.get("channel", "")
+    result = msg.get("result", {})
+    if channel == "futures.orders":
+        _handle_orders_push(result if isinstance(result, list) else [result])
+    elif channel == "futures.positions":
+        _handle_positions_push(result if isinstance(result, list) else [result])
+    elif channel == "futures.balances":
+        _handle_balances_push(result if isinstance(result, list) else [result])
 
 
-def _handle_balance_and_position(d: dict):
-    """Process balance_and_position push."""
-    # Balance data
-    bal_list = d.get("balData", [])
-    usdt_bal = next((b for b in bal_list if b.get("ccy") == "USDT"), None)
+def _handle_orders_push(orders: list):
+    """Process futures.orders push — update fill info for open position."""
+    for o in orders:
+        if o.get("contract") != config.INST_ID:
+            continue
+        status = o.get("status", "")
+        if status == "finished" and state.open_position:
+            oid = str(o.get("id", ""))
+            if oid == state.open_position.get("order_id", ""):
+                fp = o.get("fill_price", "") or o.get("price", "")
+                if fp and float(fp) > 0 and not state.open_position.get("fill_px"):
+                    state.open_position["fill_px"] = float(fp)
+                    if state.trades:
+                        state.trades[-1]["fill_px"] = float(fp)
 
-    # Position data
-    pos_list = d.get("posData", [])
-    active = [p for p in pos_list if p.get("instId") == config.INST_ID and float(p.get("pos", "0")) != 0]
 
-    # Build account data
-    if usdt_bal:
+def _handle_positions_push(positions: list):
+    """Process futures.positions push."""
+    active = [p for p in positions
+              if p.get("contract") == config.INST_ID and int(p.get("size", 0)) != 0]
+    _process_position_data(active)
+
+
+def _handle_balances_push(balances: list):
+    """Process futures.balances push."""
+    for b in balances:
         account_data = {
-            "totalEq": usdt_bal.get("eq", "0"),
-            "availBal": usdt_bal.get("availBal", "0"),
-            "upl": usdt_bal.get("upl", "0"),
+            "totalEq": b.get("balance", "0"),
+            "availBal": b.get("available", "0"),
+            "upl": b.get("unrealised_pnl", "0"),
             "ctVal": _ct_val,
             "lever": _lever,
         }
@@ -427,44 +416,8 @@ def _handle_balance_and_position(d: dict):
         except RuntimeError:
             pass
 
-    # Build position data — only if posData was present in the push
-    # (OKX omits posData or sends [] when only balance changed)
-    if pos_list:
-        _process_position_data(active)
-
-
-def _handle_account_push(d: dict):
-    """Process account channel push (totalEq level)."""
-    details = d.get("details", [])
-    usdt = next((x for x in details if x.get("ccy") == "USDT"), None)
-    if not usdt:
-        return
-    account_data = {
-        "totalEq": d.get("totalEq", "0"),
-        "availBal": usdt.get("availBal", "0"),
-        "upl": d.get("upl", "0"),
-        "ctVal": _ct_val,
-        "lever": _lever,
-    }
-    state.last_account = account_data
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(broadcast("account", account_data))
-    except RuntimeError:
-        pass
-
-
-def _handle_positions_push(d: dict):
-    """Process positions channel push."""
-    if d.get("instId") != config.INST_ID:
-        return
-    pos_size = float(d.get("pos", "0"))
-    active = [d] if pos_size != 0 else []
-    _process_position_data(active)
-
 
 def _record_trade_close(exit_type: str = None):
-    """Update the last trade record with close price, PnL, and exit type."""
     if not state.trades or not state.open_position:
         return
     pos = state.open_position
@@ -473,13 +426,11 @@ def _record_trade_close(exit_type: str = None):
     side = pos.get("side", "buy")
     size = float(pos.get("size", 0))
 
-    # PnL in USDT: (exit - entry) * contracts * ctVal, flip sign for short
     if side == "buy":
         pnl = (exit_px - entry) * size * _ct_val
     else:
         pnl = (entry - exit_px) * size * _ct_val
 
-    # Determine exit type if not provided
     if exit_type is None:
         tp, sl = pos.get("tp", 0), pos.get("sl", 0)
         if side == "buy":
@@ -487,14 +438,12 @@ def _record_trade_close(exit_type: str = None):
         else:
             exit_type = "tp" if exit_px <= tp else ("sl" if exit_px >= sl else "close")
 
-    # Update last trade record in memory
     trade = state.trades[-1]
     trade["close_price"] = exit_px
     trade["close_time"] = time.time()
     trade["pnl"] = round(pnl, 4)
     trade["exit_type"] = exit_type
 
-    # Persist and broadcast
     rewrite_log("trades", state.trades)
     try:
         loop = asyncio.get_event_loop()
@@ -505,89 +454,62 @@ def _record_trade_close(exit_type: str = None):
 
 
 def _backfill_trade_pnl():
-    """Backfill PnL and timestamps for historical trades using OKX order history."""
+    """Backfill PnL and timestamps for historical trades using Gate order history."""
     needs_pnl = [t for t in state.trades if t.get("pnl") is None]
-    needs_ts = [t for t in state.trades if t.get("fill_ts") is None]
-    if not needs_pnl and not needs_ts:
+    if not needs_pnl:
         return
     try:
         orders = executor.get_order_history(limit=100)
     except Exception as e:
         logger.error(f"Backfill: failed to fetch order history: {e}")
         return
-    filled = [o for o in orders if o.get("state") == "filled"]
+    filled = [o for o in orders if o.get("status") == "finished" and float(o.get("fill_price", 0) or 0) > 0]
     updated = False
 
     for trade in state.trades:
-        ord_id = trade.get("order_id", "")
+        ord_id = str(trade.get("order_id", ""))
         entry = trade.get("entry", 0)
         side = trade.get("side", "buy")
-        open_ts_ms = int(trade.get("open_ts", 0) * 1000)
+        open_ts = trade.get("open_ts", 0)
 
-        # --- Backfill opening timestamps via order_id ---
         if trade.get("fill_ts") is None and ord_id:
-            # Find the opening order by ordId
-            open_order = None
-            for o in filled:
-                if o.get("ordId") == ord_id:
-                    open_order = o
-                    break
-            if open_order is None:
-                # Also try fetching directly from API
-                try:
-                    open_order = executor.get_order_detail(ord_id)
-                    if open_order and open_order.get("state") != "filled":
-                        open_order = None
-                except Exception:
-                    pass
+            open_order = next((o for o in filled if str(o.get("id", "")) == ord_id), None)
             if open_order:
-                ft = open_order.get("fillTime", "")
-                if ft:
-                    trade["fill_ts"] = int(ft) / 1000
-                fp = open_order.get("fillPx", "")
-                if fp:
+                fp = open_order.get("fill_price", "")
+                if fp and float(fp) > 0:
                     trade["fill_px"] = float(fp)
-                # order_ts: use open_ts as best approximation (order was sent just before)
-                if not trade.get("order_ts"):
-                    trade["order_ts"] = trade.get("open_ts")
-                # scanner_ts/model_ts: estimate from open_ts
-                # scanner triggers ~17s before order (POST_WINDOW_S+1 delay)
+                ft = open_order.get("finish_time", "") or open_order.get("create_time", "")
+                if ft:
+                    trade["fill_ts"] = float(ft)
                 if not trade.get("scanner_ts"):
-                    trade["scanner_ts"] = trade.get("open_ts", 0) - (POST_WINDOW_S + 1)
+                    trade["scanner_ts"] = open_ts - (POST_WINDOW_S + 1)
                 if not trade.get("model_ts"):
-                    trade["model_ts"] = trade.get("open_ts", 0) - 0.5  # model runs ~0.5s before order
+                    trade["model_ts"] = open_ts - 0.5
                 updated = True
-                logger.info(f"Backfill timestamps: trade {ord_id} @ {entry:.2f}")
 
-        # --- Backfill PnL for trades missing close info ---
         if trade.get("pnl") is None:
             close_order = None
             for o in filled:
-                o_side = o.get("side", "")
-                o_ts = int(o.get("fillTime", "0") or "0")
-                if o_side != side and o_ts > open_ts_ms:
-                    if close_order is None or o_ts < int(close_order.get("fillTime", "0") or "0"):
+                o_size = int(o.get("size", 0))
+                o_ts = float(o.get("finish_time", 0) or o.get("create_time", 0))
+                o_is_close = (side == "buy" and o_size < 0) or (side == "sell" and o_size > 0)
+                if o_is_close and o_ts > open_ts:
+                    if close_order is None or o_ts < float(close_order.get("finish_time", 0) or 0):
                         close_order = o
             if close_order:
-                fill_px = float(close_order.get("fillPx", "0") or close_order.get("avgPx", "0") or "0")
-                pnl_val = float(close_order.get("pnl", "0") or "0")
-                fee = float(close_order.get("fee", "0") or "0")
-                fill_ts = int(close_order.get("fillTime", "0") or "0") / 1000
-                if pnl_val != 0:
-                    total_pnl = pnl_val + fee
+                fill_px = float(close_order.get("fill_price", 0) or 0)
+                size = float(trade.get("size", 0))
+                if side == "buy":
+                    total_pnl = (fill_px - entry) * size * _ct_val
                 else:
-                    size = float(trade.get("size", 0))
-                    if side == "buy":
-                        total_pnl = (fill_px - entry) * size * _ct_val + fee
-                    else:
-                        total_pnl = (entry - fill_px) * size * _ct_val + fee
+                    total_pnl = (entry - fill_px) * size * _ct_val
                 tp, sl = trade.get("tp", 0), trade.get("sl", 0)
                 if side == "buy":
                     exit_type = "tp" if fill_px >= tp else ("sl" if fill_px <= sl else "close")
                 else:
                     exit_type = "tp" if fill_px <= tp else ("sl" if fill_px >= sl else "close")
                 trade["close_price"] = fill_px
-                trade["close_time"] = fill_ts
+                trade["close_time"] = float(close_order.get("finish_time", 0) or 0)
                 trade["pnl"] = round(total_pnl, 4)
                 trade["exit_type"] = exit_type
                 updated = True
@@ -595,11 +517,10 @@ def _backfill_trade_pnl():
 
     if updated:
         rewrite_log("trades", state.trades)
-        logger.info(f"Backfill complete")
+        logger.info("Backfill complete")
 
 
 def _check_breakeven_stop():
-    """Adjust SL to breakeven or lock-profit level based on favorable price excursion."""
     pos = state.open_position
     if pos is None or state.current_price is None:
         return
@@ -610,31 +531,27 @@ def _check_breakeven_stop():
     side = pos.get("side", "buy")
     price = state.current_price
 
-    # Favorable excursion in R-multiples
     if side == "buy":
         fav_r = (price - entry) / atr
     else:
         fav_r = (entry - price) / atr
 
-    # Track max favorable excursion
     prev_max = pos.get("max_fav_r", 0)
     pos["max_fav_r"] = max(prev_max, fav_r)
 
-    BREAKEVEN_TRIGGER = 1.0   # move SL to entry after 1.0R favorable
-    LOCK_TRIGGER = 1.5        # move SL to entry+0.5R after 1.5R favorable
-    LOCK_LEVEL = 0.5          # locked profit level in R
+    BREAKEVEN_TRIGGER = 1.0
+    LOCK_TRIGGER = 1.5
+    LOCK_LEVEL = 0.5
 
     current_sl = pos.get("sl", 0)
     new_sl = current_sl
 
     if pos["max_fav_r"] >= LOCK_TRIGGER:
-        # Lock profit: SL at entry + LOCK_LEVEL * ATR
         if side == "buy":
             new_sl = max(current_sl, entry + LOCK_LEVEL * atr)
         else:
             new_sl = min(current_sl, entry - LOCK_LEVEL * atr)
     elif pos["max_fav_r"] >= BREAKEVEN_TRIGGER:
-        # Breakeven: SL at entry
         if side == "buy":
             new_sl = max(current_sl, entry)
         else:
@@ -643,26 +560,22 @@ def _check_breakeven_stop():
     if new_sl != current_sl:
         logger.info(f"Breakeven stop: SL moved {current_sl:.2f} -> {new_sl:.2f} (max_fav={pos['max_fav_r']:.2f}R)")
         pos["sl"] = new_sl
-        # Sync new SL to OKX algo order (cancel old TP/SL, place new)
         tp = pos.get("tp", 0)
-        close_side = "sell" if side == "buy" else "buy"
-        size = pos.get("size", str(_min_sz))
+        close_size = -pos.get("gate_size", 0)
         try:
-            ok = executor.update_tpsl(new_tp=tp, new_sl=new_sl,
-                                      close_side=close_side, size=size)
+            ok = executor.update_tpsl(new_tp=tp, new_sl=new_sl, close_size=close_size)
             if ok:
-                logger.info(f"OKX algo order updated: TP={tp:.2f}, SL={new_sl:.2f}")
+                logger.info(f"Gate price orders updated: TP={tp:.2f}, SL={new_sl:.2f}")
             else:
-                logger.warning("Failed to update OKX algo order, local SL still active")
+                logger.warning("Failed to update Gate price orders, local SL still active")
         except Exception as e:
             logger.warning(f"update_tpsl error: {e}")
-        # Check if current price already breaches new SL
         breached = (side == "buy" and price <= new_sl) or (side == "sell" and price >= new_sl)
         if breached:
             logger.info(f"Breakeven SL breached at {price:.2f}, closing position")
             try:
                 close_result = executor.close_position()
-                if close_result.get("code") == "0":
+                if close_result.get("id"):
                     _record_trade_close(exit_type="breakeven")
                     state.open_position = None
             except Exception as e:
@@ -670,10 +583,11 @@ def _check_breakeven_stop():
 
 
 def _process_position_data(active: list):
-    """Shared logic for position updates from REST or WS."""
+    """Shared logic for position updates from REST or WS.
+    Gate position fields: size (signed int), entry_price, unrealised_pnl, leverage, liq_price
+    """
     if not active:
         if state.open_position is not None:
-            # Position just closed — compute PnL and update trade record
             _record_trade_close()
             logger.info("Position closed (TP/SL hit)")
             state.open_position = None
@@ -686,13 +600,13 @@ def _process_position_data(active: list):
         return
 
     p = active[0]
-    pos_size = float(p.get("pos", "0"))
+    pos_size = int(p.get("size", 0))
     pos_side = "long" if pos_size > 0 else "short"
-    upnl = float(p.get("upl", "0") or "0")
-    avg_px = float(p.get("avgPx", "0") or "0")
-    liq_px = p.get("liqPx", "")
-    lever = p.get("lever", "")
-    margin = float(p.get("margin", "0") or "0")
+    upnl = float(p.get("unrealised_pnl", 0) or 0)
+    avg_px = float(p.get("entry_price", 0) or 0)
+    liq_px = p.get("liq_price", "")
+    lever = p.get("leverage", "")
+    margin = float(p.get("margin", 0) or 0)
 
     pos_data = {
         "status": "active",
@@ -713,17 +627,21 @@ def _process_position_data(active: list):
         pos_data["open_time"] = state.open_position.get("time", "")
         # Breakeven stop disabled — evaluated and found to hurt performance
         # _check_breakeven_stop()
-        # Horizon timeout check
         open_ts = state.open_position.get("open_ts", 0)
         elapsed_s = time.time() - open_ts if open_ts else 0
-        horizon_s = config.HORIZON * 60
+        pos_side = pos_data["side"]
+        if config.SPLIT_MODEL:
+            horizon = config.LONG_HORIZON if pos_side == "long" else config.SHORT_HORIZON
+        else:
+            horizon = config.HORIZON
+        horizon_s = horizon * 60
         pos_data["elapsed_s"] = round(elapsed_s)
         pos_data["horizon_s"] = horizon_s
         if open_ts and elapsed_s >= horizon_s:
             logger.info(f"Horizon timeout: position held {elapsed_s:.0f}s >= {horizon_s}s, closing at market")
             try:
                 close_result = executor.close_position()
-                if close_result.get("code") == "0":
+                if close_result.get("id"):
                     logger.info("Horizon timeout close successful")
                     _record_trade_close(exit_type="timeout")
                     state.open_position = None
@@ -742,61 +660,55 @@ def _process_position_data(active: list):
         pass
 
 
-def _fetch_foreign_positions():
-    """Fetch all positions and broadcast non-SWAP ones as foreign."""
-    try:
-        all_pos = executor.get_all_positions()
-        foreign = []
-        for p in (all_pos or []):
-            if float(p.get("pos", "0")) == 0:
-                continue
-            if p.get("instId") == config.INST_ID:
-                continue  # SWAP position handled by _process_position_data
-            pos_size = float(p.get("pos", "0"))
-            foreign.append({
-                "instId": p.get("instId", ""),
-                "instType": p.get("instType", ""),
-                "side": "long" if pos_size > 0 else "short",
-                "size": abs(pos_size),
-                "posCcy": p.get("posCcy", ""),
-                "avgPx": float(p.get("avgPx", "0") or "0"),
-                "upl": float(p.get("upl", "0") or "0"),
-                "liqPx": p.get("liqPx", ""),
-                "lever": p.get("lever", ""),
-                "margin": float(p.get("margin", "0") or "0"),
-                "mgnMode": p.get("mgnMode", ""),
-            })
-        state.foreign_positions = foreign
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(broadcast("foreign_positions", foreign))
-        except RuntimeError:
-            pass
-    except Exception as e:
-        logger.error(f"Fetch foreign positions error: {e}")
+# --- Warmup from REST candles ---
+def warmup_from_candles():
+    logger.info("Warming up from REST candles...")
+    candles = executor.get_candles(interval="1m", limit=300)
+    if not candles:
+        logger.warning("No candles returned for warmup")
+        return
+    # Gate returns oldest first (ascending by time)
+    for c in candles:
+        ts = int(c.get("t", 0))
+        bar = {
+            "datetime": datetime.fromtimestamp(ts, tz=timezone.utc).replace(second=0, microsecond=0),
+            "open": float(c.get("o", 0)),
+            "high": float(c.get("h", 0)),
+            "low": float(c.get("l", 0)),
+            "close": float(c.get("c", 0)),
+            "volume": float(c.get("v", 0)),
+            "aggressor_ratio": 0.5, "net_taker_vol_ratio": 0.0,
+            "trade_gini": 0.0, "large_trade_vol_ratio": 0.0,
+            "trade_intensity": float(np.log1p(float(c.get("v", 0)))),
+            "data_from_orderbook": 0,
+        }
+        engine.add_bar(bar)
+        state.recent_bars.append({
+            "time": int(bar["datetime"].timestamp()),
+            "open": bar["open"], "high": bar["high"], "low": bar["low"], "close": bar["close"],
+        })
+    state.bars_received = engine.bar_count
+    state.is_warm = engine.is_warm
+    state.current_price = float(candles[-1].get("c", 0)) if candles else 0.0
+    logger.info(f"Warmup complete: {engine.bar_count} bars, is_warm={engine.is_warm}")
 
 
-# --- REST fallback monitor (backup for private WS) ---
+# --- REST fallback monitor ---
 async def rest_fallback_monitor():
-    """Polls positions + balance via REST as fallback if private WS is slow/disconnected."""
     while True:
         await asyncio.sleep(30)
         try:
-            # Positions
             positions = executor.get_positions()
-            active = [p for p in (positions or []) if float(p.get("pos", "0")) != 0]
+            active = [p for p in (positions or [])
+                      if p.get("contract") == config.INST_ID and int(p.get("size", 0)) != 0]
             _process_position_data(active)
-            # Foreign positions (non-SWAP)
-            _fetch_foreign_positions()
-            # Balance
+
             bal = executor.get_balance()
             if bal:
-                details = bal.get("details", [])
-                usdt = next((d for d in details if d.get("ccy") == "USDT"), {})
                 account_data = {
-                    "totalEq": bal.get("totalEq", "0"),
-                    "availBal": usdt.get("availBal", "0"),
-                    "upl": bal.get("upl", "0"),
+                    "totalEq": bal.get("total", "0"),
+                    "availBal": bal.get("available", "0"),
+                    "upl": bal.get("unrealised_pnl", "0"),
                     "ctVal": _ct_val,
                     "lever": _lever,
                 }
@@ -812,70 +724,74 @@ async def lifespan(app: FastAPI):
     global model, executor, _ct_val, _lot_sz, _min_sz, _lever
     model = ModelInference()
     executor = OrderExecutor()
+
     # Fetch contract info
     try:
         inst = executor.get_instruments()
         if inst:
-            _ct_val = float(inst.get("ctVal", "0.01"))
-            _lot_sz = float(inst.get("lotSz", "0.01"))
-            _min_sz = float(inst.get("minSz", "0.01"))
-    except Exception:
-        pass
-    # Set leverage via API to ensure it matches our config
+            _ct_val = float(inst.get("quanto_multiplier", "0.0001"))
+            _lot_sz = float(inst.get("order_size_min", "1"))
+            _min_sz = float(inst.get("order_size_min", "1"))
+            logger.info(f"Contract info: quanto_multiplier={_ct_val}, min_size={_min_sz}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch contract info: {e}")
+
+    # Set leverage
     try:
         lev_result = executor.set_leverage(config.LEVERAGE)
-        if lev_result.get("code") == "0":
-            _lever = config.LEVERAGE
+        if isinstance(lev_result, dict) and lev_result.get("leverage"):
+            _lever = int(lev_result["leverage"])
             state.leverage = _lever
-            logger.info(f"Leverage set successfully: _lever={_lever}")
+            logger.info(f"Leverage set: {_lever}x")
         else:
-            logger.warning(f"Failed to set leverage: {lev_result}, using default _lever={_lever}")
+            logger.warning(f"set_leverage response: {lev_result}")
     except Exception as e:
-        logger.warning(f"set_leverage error: {e}, using default _lever={_lever}")
+        logger.warning(f"set_leverage error: {e}")
+
     warmup_from_candles()
-    # Fetch initial account + position via REST (before WS connects)
+
+    # Initial account + position via REST
     try:
         bal = executor.get_balance()
         if bal:
-            details = bal.get("details", [])
-            usdt = next((d for d in details if d.get("ccy") == "USDT"), {})
             state.last_account = {
-                "totalEq": bal.get("totalEq", "0"),
-                "availBal": usdt.get("availBal", "0"),
-                "upl": bal.get("upl", "0"),
+                "totalEq": bal.get("total", "0"),
+                "availBal": bal.get("available", "0"),
+                "upl": bal.get("unrealised_pnl", "0"),
                 "ctVal": _ct_val, "lever": _lever,
             }
     except Exception:
         pass
     try:
         positions = executor.get_positions()
-        active = [p for p in (positions or []) if float(p.get("pos", "0")) != 0]
+        active = [p for p in (positions or [])
+                  if p.get("contract") == config.INST_ID and int(p.get("size", 0)) != 0]
         _process_position_data(active)
     except Exception:
         pass
-    _fetch_foreign_positions()
+
     # Restore logs
     state.signals = load_log("signals")
     state.trades = load_log("trades")
     _backfill_trade_pnl()
+
     # Start WebSocket connections
-    ws_trades = OKXWebSocket(
+    ws_trades = GateWebSocket(
         config.WS_PUBLIC,
-        [{"channel": "trades", "instId": config.INST_ID}],
+        [{"channel": "futures.trades", "payload": [config.INST_ID]}],
         on_trades_message, name="trades",
     )
-    ws_books = OKXWebSocket(
+    ws_books = GateWebSocket(
         config.WS_PUBLIC,
-        [{"channel": "books5", "instId": config.INST_ID}],
-        on_books_message, name="books5",
+        [{"channel": "futures.order_book", "payload": [config.INST_ID, "20", "0"]}],
+        on_books_message, name="books",
     )
-    # Private WS for real-time account + position updates
-    ws_private = OKXPrivateWebSocket(
+    ws_private = GatePrivateWebSocket(
         config.WS_PRIVATE,
         [
-            {"channel": "account"},
-            {"channel": "positions", "instType": "SWAP"},
-            {"channel": "balance_and_position"},
+            {"channel": "futures.orders", "payload": [config.INST_ID]},
+            {"channel": "futures.positions", "payload": [config.INST_ID]},
+            {"channel": "futures.balances", "payload": []},
         ],
         on_private_message, name="private",
     )
@@ -952,16 +868,15 @@ async def set_risk_params(body: RiskParams):
         state.max_capital = max(0, body.max_capital)
     if body.daily_loss_limit_r is not None:
         state.daily_loss_limit_r = min(0, body.daily_loss_limit_r)
-    # Preview leverage needed at current price/ATR
     preview_lever = _lever
-    if state.current_price > 0 and _ct_val > 0 and state.max_capital > 0 and state.current_atr > 0 and config.SL_MULT > 0:
-        max_loss = state.trade_notional * state.risk_per_trade
-        loss_per_contract = config.SL_MULT * state.current_atr * _ct_val
-        contracts = max_loss / loss_per_contract
-        contracts = int(contracts / _lot_sz) * _lot_sz
-        contracts = max(_min_sz, contracts)
-        notional = contracts * _ct_val * state.current_price
-        preview_lever = max(1, math.ceil(notional / state.max_capital))
+    if state.current_price > 0 and _ct_val > 0 and state.max_capital > 0 and state.current_atr > 0:
+        sl_for_preview = config.LONG_SL if config.SPLIT_MODEL else config.SL_MULT
+        if sl_for_preview > 0:
+            max_loss = state.trade_notional * state.risk_per_trade
+            loss_per_contract = sl_for_preview * state.current_atr * _ct_val
+            contracts = max(int(_min_sz), int(max_loss / loss_per_contract))
+            notional = contracts * _ct_val * state.current_price
+            preview_lever = max(1, math.ceil(notional / state.max_capital))
     logger.info(f"Risk params updated: notional={state.trade_notional} "
                 f"R={state.risk_per_trade} max_capital={state.max_capital} "
                 f"daily_loss={state.daily_loss_limit_r} preview_lever={preview_lever}x")
@@ -977,7 +892,6 @@ async def set_risk_params(body: RiskParams):
 
 
 def _dedup_bars(bars: list) -> list:
-    """Deduplicate bars by time, keeping last occurrence (most up-to-date)."""
     seen = {}
     for b in bars:
         seen[b["time"]] = b
@@ -989,7 +903,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     ws_clients.add(ws)
     try:
-        # Send initial state
         bars = _dedup_bars(list(state.recent_bars)[-200:])
         await ws.send_text(json.dumps({
             "type": "init",
@@ -1007,7 +920,7 @@ async def websocket_endpoint(ws: WebSocket):
             }
         }, default=str))
         while True:
-            await ws.receive_text()  # keep alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
@@ -1016,3 +929,4 @@ async def websocket_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     uvicorn.run("live.main:app", host="0.0.0.0", port=config.DASHBOARD_PORT, reload=False)
+

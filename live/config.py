@@ -4,20 +4,24 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# --- OKX API credentials ---
-OKX_API_KEY = os.environ.get("OKX_API_KEY", "20f35e70-e967-474a-a486-88dcbd4d754a")
-OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "ED96880ED8EEA294F490CE8B71802B3B")
-OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "Xcx1294500682@")  # TODO: fill your passphrase
+# --- Gate.io API credentials ---
+GATE_API_KEY = os.environ.get("GATE_API_KEY", "")
+GATE_SECRET_KEY = os.environ.get("GATE_SECRET_KEY", "")
 
 # --- Trading ---
-INST_ID = "ETH-USDT-SWAP"
-TD_MODE = "cross"
-FLAG = "0"  # 0=live, 1=demo
+INST_ID = "ETH_USDT"          # Gate.io futures contract name
+SETTLE = "usdt"               # Gate.io futures settle currency
 
-# --- OKX URLs ---
-REST_BASE = "https://www.okx.com"
-WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
-WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private"
+# --- Gate.io URLs ---
+REST_BASE = "https://api.gateio.ws"
+WS_PUBLIC = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+WS_PRIVATE = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+
+# Testnet (set USE_TESTNET=1 env var to enable)
+if os.environ.get("USE_TESTNET", "0") == "1":
+    REST_BASE = "https://fx-api-testnet.gateio.ws"
+    WS_PUBLIC = "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
+    WS_PRIVATE = "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"
 
 # --- Load best_config.json ---
 _cfg_path = PROJECT_ROOT / "best_config.json"
@@ -26,7 +30,6 @@ with open(_cfg_path) as f:
 
 SCANNER_NAME: str = BEST.get("scanner_name", "flow_reversal")
 SCANNER_VARIANT: str = BEST.get("scanner_variant", "")
-# Parse "flow_reversal|flow_abs=0.05,obi_abs=0.0,..." into dict
 _param_str = SCANNER_VARIANT.split("|", 1)[1] if "|" in SCANNER_VARIANT else ""
 SCANNER_PARAMS: dict = {}
 for kv in _param_str.split(","):
@@ -41,11 +44,26 @@ THRESHOLD: float = float(BEST["threshold"])
 LABEL_MODE: str = BEST.get("label_mode", "first_touch")
 LONG_ONLY: bool = BEST.get("long_only", False)
 
+# --- Split long/short model support ---
+SPLIT_MODEL: bool = BEST.get("split_model", False)
+LONG_CFG: dict = BEST.get("long_config", {})
+SHORT_CFG: dict = BEST.get("short_config", {})
+LONG_TP: float = float(LONG_CFG.get("tp", TP_MULT))
+LONG_SL: float = float(LONG_CFG.get("sl", SL_MULT))
+LONG_THRESHOLD: float = float(LONG_CFG.get("threshold", THRESHOLD))
+LONG_HORIZON: int = int(LONG_CFG.get("h", HORIZON))
+SHORT_TP: float = float(SHORT_CFG.get("tp", TP_MULT))
+SHORT_SL: float = float(SHORT_CFG.get("sl", SL_MULT))
+SHORT_THRESHOLD: float = float(SHORT_CFG.get("threshold", THRESHOLD))
+SHORT_HORIZON: int = int(SHORT_CFG.get("h", HORIZON))
+
 MODEL_PATH = str(PROJECT_ROOT / "model_sniper_v3_first_touch.json")
 
 # --- Multi-model support ---
 MODEL_TYPE: str = BEST.get("model_type", "xgb")
 MODEL_PATH_XGB = str(PROJECT_ROOT / "model_xgb.json")
+MODEL_PATH_XGB_LONG = str(PROJECT_ROOT / "model_xgb_long.json")
+MODEL_PATH_XGB_SHORT = str(PROJECT_ROOT / "model_xgb_short.json")
 MODEL_PATH_LGB = str(PROJECT_ROOT / "model_lgb.txt")
 MODEL_PATH_CB = str(PROJECT_ROOT / "model_catboost.cbm")
 
@@ -56,11 +74,11 @@ BAR_WINDOW = 500
 # --- Risk ---
 LEVERAGE = 1
 MAX_POSITIONS = 1
-TRADE_NOTIONAL = 100      # nominal notional for risk calc (max loss = notional * R)
-RISK_PER_TRADE = 0.08     # fraction of notional risked per trade
-MAX_CAPITAL = 200          # max available margin in USD (actual account balance)
-DAILY_LOSS_LIMIT_R = -5.0  # stop trading after cumulative daily loss exceeds this (in R-multiples)
-MAX_TRADES_PER_DAY = 10    # max trades per calendar day
+TRADE_NOTIONAL = 100
+RISK_PER_TRADE = 0.08
+MAX_CAPITAL = 200
+DAILY_LOSS_LIMIT_R = -5.0
+MAX_TRADES_PER_DAY = 10
 
 # --- Persistence ---
 DATA_DIR = Path(__file__).parent / "data"

@@ -4,7 +4,7 @@ from collections import deque
 
 
 class OrderbookState:
-    """Maintains live orderbook state from books5 and computes OB features."""
+    """Maintains live orderbook state from Gate.io futures.order_book and computes OB features."""
 
     def __init__(self):
         self._bids: list[tuple[float, float]] = []
@@ -14,8 +14,16 @@ class OrderbookState:
         self._update_count = 0
 
     def update(self, data: dict):
-        self._bids = [(float(b[0]), float(b[1])) for b in data.get("bids", [])]
-        self._asks = [(float(a[0]), float(a[1])) for a in data.get("asks", [])]
+        """Parse Gate.io futures.order_book update.
+        Gate format: {"asks": [{"p": "3001.1", "s": 100}, ...], "bids": [...]}
+        """
+        bids_raw = data.get("bids", [])
+        asks_raw = data.get("asks", [])
+        self._bids = [(float(b["p"]), float(b["s"])) for b in bids_raw if b.get("s", 0) != 0]
+        self._asks = [(float(a["p"]), float(a["s"])) for a in asks_raw if a.get("s", 0) != 0]
+        # Sort: bids descending, asks ascending
+        self._bids.sort(key=lambda x: -x[0])
+        self._asks.sort(key=lambda x: x[0])
         self._update_count += 1
 
     def get_features(self) -> dict:
@@ -40,16 +48,15 @@ class OrderbookState:
         self._obi_history.append(obi)
         self._spread_history.append(spread_bps)
 
-        # Depth at different levels (approximate 1/5/20 with available 5 levels)
         depth_bid_1 = float(bs[0]) if len(bs) > 0 else 0.0
         depth_ask_1 = float(a_s[0]) if len(a_s) > 0 else 0.0
         depth_bid_5 = float(bs[:5].sum())
         depth_ask_5 = float(a_s[:5].sum())
+        depth_bid_20 = float(bs[:20].sum())
+        depth_ask_20 = float(a_s[:20].sum())
 
-        # Microprice
         microprice = (best_bid * a_s[0] + best_ask * bs[0]) / (bs[0] + a_s[0]) if (bs[0] + a_s[0]) > 0 else mid
 
-        # Wall detection (largest single level)
         max_bid_size = float(bs.max()) if len(bs) > 0 else 0.0
         max_ask_size = float(a_s.max()) if len(a_s) > 0 else 0.0
         wall_conc_bid = max_bid_size / total_bid if total_bid > 0 else 0.0
@@ -59,15 +66,15 @@ class OrderbookState:
             "obi": obi,
             "obi_1": (bs[0] - a_s[0]) / (bs[0] + a_s[0]) if (bs[0] + a_s[0]) > 0 else 0.0,
             "obi_5": obi,
-            "obi_20": obi,  # approximate with 5-level
+            "obi_20": obi,
             "ob_spread_bps": spread_bps,
             "spread": spread,
             "ob_depth_bid_1": depth_bid_1,
             "ob_depth_ask_1": depth_ask_1,
             "ob_depth_bid_5": depth_bid_5,
             "ob_depth_ask_5": depth_ask_5,
-            "ob_depth_bid_20": depth_bid_5,  # approximate
-            "ob_depth_ask_20": depth_ask_5,  # approximate
+            "ob_depth_bid_20": depth_bid_20,
+            "ob_depth_ask_20": depth_ask_20,
             "ob_microprice": microprice,
             "ob_mid_close": mid,
             "ob_ask_wall_size_20": max_ask_size,
@@ -81,7 +88,6 @@ class OrderbookState:
         }
 
     def get_snapshot(self) -> dict:
-        """Lightweight snapshot for dashboard display."""
         if not self._bids or not self._asks:
             return {"bids": [], "asks": [], "obi": 0.0, "spread": 0.0, "spread_bps": 0.0, "mid": 0.0}
         bids = [{"price": p, "size": s} for p, s in self._bids[:5]]

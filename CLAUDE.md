@@ -37,7 +37,7 @@ python tune_xgb_params.py
 # 7. Compare event-aligned post-window durations (5s/10s/15s/20s)
 python compare_post_windows.py
 
-# 8. Run live trading system (OKX ETH-USDT-SWAP)
+# 8. Run live trading system (Gate.io ETH_USDT futures)
 python -m live.main
 ```
 
@@ -52,7 +52,7 @@ python test_horizon_close.py   # Compare horizon-close vs hold-until-TP/SL PnL
 
 ## Architecture
 
-**Data flow:** raw data → `pipline_modified.py` → `dataset_enhanced.parquet` → tuning/search/training scripts → models + reports.
+**Data flow:** raw data → `pipline_modified.py` → `dataset_enhanced.parquet` → tuning/search/training scripts → models + reports. For Gate.io data: `download_gate_data.py` → `build_gate_dataset.py` → `dataset_gate_enhanced.parquet`.
 
 ### Core Modules
 
@@ -74,20 +74,20 @@ python test_horizon_close.py   # Compare horizon-close vs hold-until-TP/SL PnL
 
 ### Live Trading System (`live/`)
 
-Real-time trading system for OKX perpetual swaps. Runs as a FastAPI app with a WebSocket-powered dashboard at `http://localhost:8080`.
+Real-time trading system for Gate.io USDT perpetual futures. Runs as a FastAPI app with a WebSocket-powered dashboard at `http://localhost:8080`.
 
-**Pipeline:** OKX WebSocket trades → `BarAggregator` (1-min OHLCV + microstructure) → `FeatureEngine` (calls `pipline_modified.add_features()` directly) → `FlowReversalScanner` → `ModelInference` (XGBoost/LGB/CatBoost/ensemble) → `OrderExecutor` (REST API market orders with TP/SL).
+**Pipeline:** Gate.io WebSocket trades → `BarAggregator` (1-min OHLCV + microstructure) → `FeatureEngine` (calls `pipline_modified.add_features()` directly) → `FlowReversalScanner` → `ModelInference` (XGBoost/LGB/CatBoost/ensemble) → `OrderExecutor` (REST API market orders with TP/SL).
 
 Key modules:
-- **`live/config.py`** — Loads `best_config.json` for threshold/TP/SL/scanner params. Constants: `WARMUP_BARS=300`, `BAR_WINDOW=500`, `MAX_POSITIONS=1`, `POST_WINDOW_S=15`. Supports `MODEL_TYPE` in `{xgb, lgb, catboost, ensemble}`.
+- **`live/config.py`** — Loads `best_config.json` for threshold/TP/SL/scanner params. Gate.io API credentials from env vars. Constants: `WARMUP_BARS=300`, `BAR_WINDOW=500`, `MAX_POSITIONS=1`. Supports `MODEL_TYPE` in `{xgb, lgb, catboost, ensemble}`.
 - **`live/bar_aggregator.py`** — Builds 1-min bars from raw trades with microstructure features (aggressor_ratio, trade_gini, large_trade_vol_ratio, trade_intensity).
-- **`live/orderbook_state.py`** — Maintains books5 state, computes OBI, spread, depth, microprice, wall detection features.
+- **`live/orderbook_state.py`** — Maintains orderbook state, computes OBI, spread, depth, microprice, wall detection features.
 - **`live/feature_engine.py`** — Rolling window (500 bars, 300 warmup). Calls `add_features()` from `pipline_modified.py` on each bar to match backtest feature computation exactly.
-- **`live/event_aligner.py`** — Computes event-aligned features from live tick data after a `POST_WINDOW_S=15` second delay post bar-close.
+- **`live/event_aligner.py`** — Computes event-aligned features from live tick data after a `POST_WINDOW_S=15` second delay post bar-close. `POST_WINDOW_S` is defined here, not in config.
 - **`live/scanner.py`** — `FlowReversalScanner` evaluates range_pos, flow, OBI conditions. Parameterized via `best_config.json` scanner_variant string.
 - **`live/model_inference.py`** — Loads model, applies directional feature transforms (mirrors `add_directional_features`), predicts probability, compares to threshold. Supports multi-model with fallback logic.
-- **`live/execution.py`** — OKX REST client with HMAC signing. Places market orders with attached TP/SL algo orders.
-- **`live/ws_client.py`** — Async OKX WebSocket client with auto-reconnect and exponential backoff.
+- **`live/execution.py`** — Gate.io REST client with HMAC-SHA512 signing. Places market orders with separate TP/SL price orders.
+- **`live/ws_client.py`** — Async Gate.io WebSocket client with auto-reconnect, exponential backoff, and per-subscription HMAC-SHA512 auth for private channels.
 - **`live/state.py`** — `AppState` dataclass + JSONL persistence for signals/trades in `live/data/`.
 - **`live/main.py`** — FastAPI app. Warms up from 300 REST candles on startup, then processes live bars. Dashboard broadcasts via WebSocket.
 
@@ -132,6 +132,40 @@ Signal delay: When the scanner triggers at bar close, the system waits ~16 secon
 
 This file is the central config consumed by `train_xgb.py`, `train_multi_model.py`, and `live/config.py`. Updated by `tune_all_modified.py`.
 
+## Gate.io Migration (Completed)
+
+The live trading system has been migrated from OKX to Gate.io. Historical data pipeline scripts are also provided.
+
+**Historical data pipeline:**
+```bash
+# Download raw data to /Volumes/TU280Pro/quant/raw_data
+python download_gate_data.py --market ETH_USDT --start-month 202401 --end-month 202603
+
+# Build parquet dataset (compatible with train_xgb.py)
+python build_gate_dataset.py --market ETH_USDT --start-month 202401 --end-month 202603 \
+    --input-dir /Volumes/TU280Pro/quant/raw_data --output dataset_gate_enhanced.parquet
+```
+
+**Live system env vars (Gate.io):**
+```bash
+export GATE_API_KEY="your_key"
+export GATE_SECRET_KEY="your_secret"
+export USE_TESTNET=1  # optional: use Gate testnet
+```
+
+**Key Gate.io differences vs OKX:**
+- Auth: HMAC-SHA512, no passphrase — headers: `KEY`, `SIGN`, `Timestamp`
+- WS auth: per-subscription `auth` field with HMAC-SHA512 of `channel=X&event=subscribe&time=T`
+- Order direction: `size` positive=long, negative=short (no `side` field)
+- Contract size: `quanto_multiplier` from `GET /api/v4/futures/usdt/contracts/ETH_USDT`
+- TP/SL: `POST /api/v4/futures/usdt/price_orders` (separate TP and SL orders)
+- Close position: reverse order with `reduce_only: true`
+- WS channels: `futures.trades`, `futures.order_book`, `futures.orders`, `futures.positions`, `futures.balances`
+- Candles response: list of `{"t": ts, "o": open, "h": high, "l": low, "c": close, "v": vol}`
+- Testnet: `wss://fx-ws-testnet.gateio.ws/v4/ws/usdt`, `https://fx-api-testnet.gateio.ws/api/v4`
+
+**Modules NOT modified (pure compute):** `feature_engine.py`, `scanner.py`, `model_inference.py`, `event_aligner.py`, `state.py`
+
 ## Conventions
 
 - Dataset file: `dataset_enhanced.parquet` (gitignored, must be generated locally via `pipline_modified.py`)
@@ -139,4 +173,4 @@ This file is the central config consumed by `train_xgb.py`, `train_multi_model.p
 - Model files: `model_sniper_v3_*.json`, `model_xgb.json`, `model_lgb.txt`, `model_catboost.cbm`
 - Plots output to `./plots/`
 - Live logs: `live/data/signals.jsonl`, `live/data/trades.jsonl`
-- OKX API credentials: use env vars (`OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE`). Set `FLAG="1"` in `live/config.py` for demo trading.
+- Gate.io API credentials: use env vars (`GATE_API_KEY`, `GATE_SECRET_KEY`). Set `USE_TESTNET=1` for testnet.

@@ -24,8 +24,7 @@ class BarAggregator:
         self._current_minute: datetime | None = None
         self._reset_accum()
         self._avg_trade_size = deque(maxlen=1000)
-        # Tick buffer for event-aligned feature computation
-        self._tick_buffer: deque[tuple[int, float, float]] = deque(maxlen=5000)  # (ts_ns, price, size)
+        self._tick_buffer: deque[tuple[int, float, float]] = deque(maxlen=5000)
 
     def _reset_accum(self):
         self._open = self._high = self._low = self._close = 0.0
@@ -36,6 +35,11 @@ class BarAggregator:
         self._count = 0
 
     def ingest_trade(self, price: float, size: float, side: str, ts_ms: int):
+        """Ingest a single trade tick.
+        Gate.io: size is signed (positive=buy, negative=sell), pass abs(size) here.
+        side: 'buy' or 'sell'
+        ts_ms: millisecond timestamp
+        """
         dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
         minute = dt.replace(second=0, microsecond=0)
 
@@ -62,8 +66,7 @@ class BarAggregator:
         self._trade_sizes.append(size)
         self._avg_trade_size.append(size)
         self._count += 1
-        # Store tick for event alignment
-        self._tick_buffer.append((ts_ms * 1_000_000, price, size))  # store as nanoseconds
+        self._tick_buffer.append((ts_ms * 1_000_000, price, size))
 
     def _finalize(self):
         if self._count == 0:

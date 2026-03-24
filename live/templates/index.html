@@ -486,12 +486,13 @@ const BJOffset = 8 * 3600;
 function toBJ(ts) { return ts + BJOffset; }
 
 const chart = LightweightCharts.createChart(document.getElementById('chart-container'), {
+  autoSize:true,
   layout:{background:{color:'#111827'},textColor:'#94a3b8'},
   grid:{vertLines:{color:'#1e293b'},horzLines:{color:'#1e293b'}},
   crosshair:{mode:0},
-  timeScale:{timeVisible:true,secondsVisible:false},
+  timeScale:{timeVisible:true,secondsVisible:false,tickMarkFormatter:(t)=>{const d=new Date(t*1000);const H=String(d.getUTCHours()).padStart(2,'0');const M=String(d.getUTCMinutes()).padStart(2,'0');return H+':'+M;}},
   rightPriceScale:{borderColor:'#1e293b'},
-  localization:{timeFormatter:t=>{const d=new Date((t-BJOffset)*1000);return d.toISOString().slice(11,19);}},
+  localization:{timeFormatter:t=>{const d=new Date(t*1000);return d.toISOString().slice(11,16);}},
 });
 const candleSeries = chart.addCandlestickSeries({
   upColor:'#22c55e',downColor:'#ef4444',borderUpColor:'#22c55e',borderDownColor:'#ef4444',
@@ -500,6 +501,7 @@ const candleSeries = chart.addCandlestickSeries({
 const markers = [];
 
 const eqChart = LightweightCharts.createChart(document.getElementById('eq-container'), {
+  autoSize:true,
   layout:{background:{color:'#111827'},textColor:'#94a3b8'},
   grid:{vertLines:{color:'#1e293b'},horzLines:{color:'#1e293b'}},
   timeScale:{timeVisible:true},rightPriceScale:{borderColor:'#1e293b'},
@@ -926,6 +928,7 @@ function connectWS() {
         deduped.sort((a,b) => a.time - b.time);
         _barStartTime = deduped[0].time;
         candleSeries.setData(deduped);
+        chart.timeScale().fitContent();
       }
       if (msg.data.signals) msg.data.signals.slice(-20).forEach(addSignal);
       if (msg.data.trades) {
@@ -1005,7 +1008,7 @@ function connectWS() {
     } else if (msg.type === 'account') {
       updateAccount(msg.data);
     }
-    } catch(err) { console.warn('WS message error:', err, msg.type); }
+    } catch(err) { console.error('WS message error:', err, msg.type); document.title = 'ERR: ' + err.message; }
   };
   ws.onclose = () => {
     document.getElementById('dot-trades').className = 'dot off';

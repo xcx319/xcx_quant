@@ -51,14 +51,20 @@ def _prepare_features(feat_row: pd.Series, event_dir: int, scanner_score: float,
 
 
 class ModelInference:
-    """Loads model(s) based on config.MODEL_TYPE and runs prediction."""
+    """Loads model(s) based on config.MODEL_TYPE and runs prediction.
+    When config.SPLIT_MODEL is True, loads separate long/short XGBoost models
+    and routes predictions by event_dir with direction-specific thresholds.
+    """
 
     def __init__(self, threshold: float = config.THRESHOLD):
         self.threshold = threshold
         self._model_type = config.MODEL_TYPE
         self._feature_names: list[str] | None = None
+        self._split_model = config.SPLIT_MODEL
 
-        if self._model_type == "ensemble":
+        if self._split_model and self._model_type == "xgb":
+            self._load_split_xgb()
+        elif self._model_type == "ensemble":
             self._load_ensemble()
         elif self._model_type == "stacked":
             self._load_stacked()
@@ -69,7 +75,10 @@ class ModelInference:
         else:
             self._load_xgb()
 
-        logger.info(f"Model loaded: type={self._model_type}, threshold={threshold}")
+        if self._split_model:
+            logger.info(f"Model loaded: SPLIT mode, long_thr={config.LONG_THRESHOLD}, short_thr={config.SHORT_THRESHOLD}")
+        else:
+            logger.info(f"Model loaded: type={self._model_type}, threshold={threshold}")
 
     # --- loaders ---
 
@@ -80,6 +89,23 @@ class ModelInference:
         self._booster = xgb.Booster()
         self._booster.load_model(path)
         self._feature_names = self._booster.feature_names
+
+    def _load_split_xgb(self):
+        """Load separate long/short XGBoost models. Falls back to single model if files missing."""
+        import os
+        long_path = config.MODEL_PATH_XGB_LONG
+        short_path = config.MODEL_PATH_XGB_SHORT
+        if os.path.exists(long_path) and os.path.exists(short_path):
+            self._booster_long = xgb.Booster()
+            self._booster_long.load_model(long_path)
+            self._booster_short = xgb.Booster()
+            self._booster_short.load_model(short_path)
+            self._feature_names = self._booster_long.feature_names
+            logger.info(f"Split models loaded: {long_path}, {short_path}")
+        else:
+            logger.warning(f"Split model files not found, falling back to single model")
+            self._split_model = False
+            self._load_xgb()
 
     def _load_lgb(self):
         import lightgbm as lgb
@@ -141,25 +167,41 @@ class ModelInference:
                 event_features: dict | None = None) -> dict:
         row = _prepare_features(feat_row, event_dir, scanner_score, event_features)
 
-        if self._model_type == "stacked":
+        if self._split_model:
+            # Route to direction-specific model and threshold
+            if event_dir == 1:
+                booster = self._booster_long
+                threshold = config.LONG_THRESHOLD
+            else:
+                booster = self._booster_short
+                threshold = config.SHORT_THRESHOLD
+            values = self._extract_values(row)
+            dmat = xgb.DMatrix(np.array([values]), feature_names=self._feature_names, missing=np.nan)
+            prob = float(booster.predict(dmat)[0])
+        elif self._model_type == "stacked":
             xgb_p = self._predict_xgb(row)
             lgb_p = self._predict_lgb(row)
             cb_p = self._predict_catboost(row)
             meta_input = np.array([[xgb_p, lgb_p, cb_p]])
             prob = float(self._meta_model.predict_proba(meta_input)[0, 1])
+            threshold = self.threshold
         elif self._model_type == "ensemble":
             prob = (self._predict_xgb(row) + self._predict_lgb(row) + self._predict_catboost(row)) / 3.0
+            threshold = self.threshold
         elif self._model_type == "lgb":
             prob = self._predict_lgb(row)
+            threshold = self.threshold
         elif self._model_type == "catboost":
             prob = self._predict_catboost(row)
+            threshold = self.threshold
         else:
             prob = self._predict_xgb(row)
+            threshold = self.threshold
 
-        signal = prob >= self.threshold
+        signal = prob >= threshold
         return {
             "prob": prob,
             "signal": signal,
             "direction": "long" if event_dir == 1 else "short",
-            "threshold": self.threshold,
+            "threshold": threshold,
         }
