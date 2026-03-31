@@ -65,7 +65,11 @@ MODEL_PATH_XGB = str(PROJECT_ROOT / "model_xgb.json")
 MODEL_PATH_XGB_LONG = str(PROJECT_ROOT / "model_xgb_long.json")
 MODEL_PATH_XGB_SHORT = str(PROJECT_ROOT / "model_xgb_short.json")
 MODEL_PATH_LGB = str(PROJECT_ROOT / "model_lgb.txt")
+MODEL_PATH_LGB_LONG = str(PROJECT_ROOT / "model_lgb_long.txt")
+MODEL_PATH_LGB_SHORT = str(PROJECT_ROOT / "model_lgb_short.txt")
 MODEL_PATH_CB = str(PROJECT_ROOT / "model_catboost.cbm")
+MODEL_PATH_CB_LONG = str(PROJECT_ROOT / "model_catboost_long.cbm")
+MODEL_PATH_CB_SHORT = str(PROJECT_ROOT / "model_catboost_short.cbm")
 
 # --- Feature engine ---
 WARMUP_BARS = 300

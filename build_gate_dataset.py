@@ -273,7 +273,12 @@ def load_orderbook_features(input_dir: Path, market: str, months: list[str]) -> 
 
         ba, aa = ba.loc[common], aa.loc[common]
         mid = (ba["best"] + aa["best"]) / 2.0
-        valid = (ba["best"] < aa["best"]) & (mid > 0)
+        valid = mid > 0
+        # For crossed book (bid >= ask), use mid as best estimate
+        crossed = ba["best"] >= aa["best"]
+        if crossed.any():
+            ba.loc[crossed, "best"] = mid[crossed] - 0.005
+            aa.loc[crossed, "best"] = mid[crossed] + 0.005
         ba, aa, mid = ba[valid], aa[valid], mid[valid]
         if ba.empty:
             continue
@@ -336,31 +341,33 @@ def build_dataset(input_dir: Path, market: str, months: list[str], output: Path)
             df[col] = 0.0
         df["aggressor_ratio"] = 0.5
 
+    _ob_defaults = {
+        "obi": 0.0, "obi_1": 0.0, "obi_5": 0.0, "obi_20": 0.0,
+        "ob_spread_bps": 1.0,
+        "ob_depth_bid_1": 1.0, "ob_depth_ask_1": 1.0,
+        "ob_depth_bid_5": 5.0, "ob_depth_ask_5": 5.0,
+        "ob_depth_bid_20": 20.0, "ob_depth_ask_20": 20.0,
+        "ob_ask_wall_size_20": 0.0, "ob_bid_wall_size_20": 0.0,
+        "ob_ask_wall_conc_20": 0.0, "ob_bid_wall_conc_20": 0.0,
+        "ob_ask_wall_levels_20": 0.0, "ob_bid_wall_levels_20": 0.0,
+        "ob_quote_count": 0.0, "data_from_orderbook": 0,
+    }
+
     if not ob.empty:
         df = df.join(ob, how="left")
+        # Fill uncovered minutes with same defaults as the no-OB branch
+        ob_missing = df["data_from_orderbook"].isna()
+        if ob_missing.any():
+            for col, val in _ob_defaults.items():
+                if col in df.columns:
+                    df.loc[ob_missing, col] = val
+            df.loc[ob_missing, "ob_microprice"] = df.loc[ob_missing, "close"]
+            df.loc[ob_missing, "ob_mid_close"] = df.loc[ob_missing, "close"]
     else:
-        # Use close price as microprice/mid proxy so ratio features don't produce NaN
-        df["obi"] = 0.0
-        df["obi_1"] = 0.0
-        df["obi_5"] = 0.0
-        df["obi_20"] = 0.0
-        df["ob_spread_bps"] = 1.0          # non-zero so rolling std/ratio are finite
-        df["ob_depth_bid_1"] = 1.0
-        df["ob_depth_ask_1"] = 1.0
-        df["ob_depth_bid_5"] = 5.0
-        df["ob_depth_ask_5"] = 5.0
-        df["ob_depth_bid_20"] = 20.0
-        df["ob_depth_ask_20"] = 20.0
+        for col, val in _ob_defaults.items():
+            df[col] = val
         df["ob_microprice"] = df["close"]
         df["ob_mid_close"] = df["close"]
-        df["ob_ask_wall_size_20"] = 0.0
-        df["ob_bid_wall_size_20"] = 0.0
-        df["ob_ask_wall_conc_20"] = 0.0
-        df["ob_bid_wall_conc_20"] = 0.0
-        df["ob_ask_wall_levels_20"] = 0.0
-        df["ob_bid_wall_levels_20"] = 0.0
-        df["ob_quote_count"] = 0.0
-        df["data_from_orderbook"] = 0
 
     df = df.fillna(0.0)
     df["exchange"] = "gate"

@@ -10,7 +10,8 @@ Usage:
         --types orderbooks --output-dir /Volumes/TU280Pro/quant/raw_data
 """
 from __future__ import annotations
-import argparse, calendar, gzip, logging, shutil
+import argparse, calendar, gzip, logging, shutil, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,9 @@ import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+_progress_lock = threading.Lock()
+_progress = {"done": 0, "total": 0, "ok": 0, "skip": 0, "fail": 0}
 
 BASE_URL = "https://download.gatedata.org"
 BIZ = "futures_usdt"
@@ -35,29 +39,31 @@ def iter_months(start: str, end: str):
             y += 1
 
 
-def download_file(url: str, dest: Path, client: httpx.Client) -> bool:
-    """Download url to dest. Returns True on success, False on 404/skip."""
+def download_file(url: str, dest: Path, client: httpx.Client, retries: int = 3) -> bool:
+    """Download url to dest with retries. Returns True on success, False on 404/skip."""
     if dest.exists():
         logger.debug(f"  Skip (exists): {dest.name}")
         return True
     dest.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"  Downloading: {url}")
-    try:
-        with client.stream("GET", url, follow_redirects=True) as r:
-            if r.status_code == 404:
-                logger.warning(f"  Not found (404): {url}")
+    for attempt in range(retries):
+        try:
+            with client.stream("GET", url, follow_redirects=True) as r:
+                if r.status_code == 404:
+                    return False
+                r.raise_for_status()
+                tmp = dest.with_suffix(f".tmp.{threading.current_thread().ident}")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                tmp.rename(dest)
+            return True
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                logger.error(f"  Error downloading {dest.name}: {e}")
                 return False
-            r.raise_for_status()
-            tmp = dest.with_suffix(".tmp")
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_bytes(chunk_size=65536):
-                    f.write(chunk)
-            tmp.rename(dest)
-        logger.info(f"  Saved: {dest.name} ({dest.stat().st_size // 1024} KB)")
-        return True
-    except Exception as e:
-        logger.error(f"  Error downloading {url}: {e}")
-        return False
+    return False
 
 
 def decompress_gz(gz_path: Path) -> Path:
@@ -105,54 +111,82 @@ def download_monthly(output_dir: Path, market: str, dtype: str, months: list[str
             stats["skip"] += 1
 
 
+def _download_one_ob(task: tuple, keep_gz: bool) -> str:
+    """Download + convert one orderbook file. Returns 'ok', 'skip', or 'fail'."""
+    url, dest, pq_dest = task
+    if pq_dest.exists():
+        return "skip"
+    client = httpx.Client(timeout=300, follow_redirects=True)
+    try:
+        ok = download_file(url, dest, client)
+        if not ok:
+            return "fail"
+        if dest.exists():
+            csv_path = decompress_gz(dest)
+            _csv_to_parquet(csv_path, pq_dest)
+            csv_path.unlink(missing_ok=True)
+            if not keep_gz and dest.exists():
+                dest.unlink()
+            return "ok"
+        return "skip"
+    finally:
+        client.close()
+
+
 def download_orderbooks_hourly(output_dir: Path, market: str, months: list[str],
-                                client: httpx.Client, keep_gz: bool, stats: dict):
+                                client: httpx.Client, keep_gz: bool, stats: dict,
+                                workers: int = 1):
     """Download hourly orderbook files for given months.
     URL pattern: {BASE_URL}/futures_usdt/orderbooks/{YYYYMM}/{MARKET}-{YYYYMMDDHH}.csv.gz
     Skips hours that haven't completed yet (current UTC hour and beyond).
     """
     now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
+    # Collect all tasks first
+    tasks = []
     for month in months:
         year = int(month[:4])
         mon = int(month[4:])
         days_in_month = calendar.monthrange(year, mon)[1]
-
-        logger.info(f"Downloading orderbooks for {month} ({days_in_month} days)...")
         for day in range(1, days_in_month + 1):
             for hour in range(24):
                 dt = datetime(year, mon, day, hour, tzinfo=timezone.utc)
                 if dt >= now_utc:
-                    logger.info(f"  Reached current hour {dt}, stopping")
-                    return
-
+                    break
                 tag = f"{year}{mon:02d}{day:02d}{hour:02d}"
                 filename = f"{market}-{tag}.csv.gz"
                 url = f"{BASE_URL}/{BIZ}/orderbooks/{month}/{filename}"
                 dest = output_dir / "orderbooks" / filename
                 pq_dest = dest.parent / f"{market}-{tag}.parquet"
-
-                # Skip if parquet already exists
                 if pq_dest.exists():
-                    logger.debug(f"  Skip (parquet exists): {pq_dest.name}")
                     stats["skip"] += 1
                     continue
+                tasks.append((url, dest, pq_dest))
 
-                ok = download_file(url, dest, client)
-                if not ok:
-                    stats["fail"] += 1
-                    continue
+    if not tasks:
+        logger.info("All orderbook files already downloaded")
+        return
 
-                if dest.exists():
-                    csv_path = decompress_gz(dest)
-                    # Convert CSV → parquet and delete both gz and csv
-                    _csv_to_parquet(csv_path, pq_dest)
-                    csv_path.unlink(missing_ok=True)
-                    if not keep_gz and dest.exists():
-                        dest.unlink()
-                    stats["ok"] += 1
-                else:
-                    stats["skip"] += 1
+    logger.info(f"Downloading {len(tasks)} orderbook files with {workers} workers...")
+    dest_dir = output_dir / "orderbooks"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if workers <= 1:
+        for i, task in enumerate(tasks):
+            result = _download_one_ob(task, keep_gz)
+            stats[result] += 1
+            if (i + 1) % 50 == 0:
+                logger.info(f"  Progress: {i+1}/{len(tasks)}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_download_one_ob, t, keep_gz): t for t in tasks}
+            done_count = 0
+            for fut in as_completed(futures):
+                result = fut.result()
+                stats[result] += 1
+                done_count += 1
+                if done_count % 50 == 0:
+                    logger.info(f"  Progress: {done_count}/{len(tasks)} (ok={stats['ok']} fail={stats['fail']})")
 
 
 def main():
@@ -164,6 +198,7 @@ def main():
                         help="Comma-separated data types")
     parser.add_argument("--output-dir", default="/Volumes/TU280Pro/quant/raw_data")
     parser.add_argument("--keep-gz", action="store_true", help="Keep .gz files after decompression")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel download workers for orderbooks")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -179,7 +214,7 @@ def main():
         for dtype in data_types:
             if dtype == "orderbooks":
                 download_orderbooks_hourly(output_dir, args.market, months, client,
-                                           args.keep_gz, stats)
+                                           args.keep_gz, stats, workers=args.workers)
             else:
                 download_monthly(output_dir, args.market, dtype, months, client,
                                  args.keep_gz, stats)

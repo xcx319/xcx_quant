@@ -52,8 +52,9 @@ def _prepare_features(feat_row: pd.Series, event_dir: int, scanner_score: float,
 
 class ModelInference:
     """Loads model(s) based on config.MODEL_TYPE and runs prediction.
-    When config.SPLIT_MODEL is True, loads separate long/short XGBoost models
+    When config.SPLIT_MODEL is True, loads separate long/short models
     and routes predictions by event_dir with direction-specific thresholds.
+    Supports split mode for xgb, lgb, and catboost.
     """
 
     def __init__(self, threshold: float = config.THRESHOLD):
@@ -62,8 +63,8 @@ class ModelInference:
         self._feature_names: list[str] | None = None
         self._split_model = config.SPLIT_MODEL
 
-        if self._split_model and self._model_type == "xgb":
-            self._load_split_xgb()
+        if self._split_model and self._model_type in ("xgb", "lgb", "catboost"):
+            self._load_split(self._model_type)
         elif self._model_type == "ensemble":
             self._load_ensemble()
         elif self._model_type == "stacked":
@@ -76,7 +77,7 @@ class ModelInference:
             self._load_xgb()
 
         if self._split_model:
-            logger.info(f"Model loaded: SPLIT mode, long_thr={config.LONG_THRESHOLD}, short_thr={config.SHORT_THRESHOLD}")
+            logger.info(f"Model loaded: SPLIT {self._model_type}, long_thr={config.LONG_THRESHOLD}, short_thr={config.SHORT_THRESHOLD}")
         else:
             logger.info(f"Model loaded: type={self._model_type}, threshold={threshold}")
 
@@ -90,22 +91,41 @@ class ModelInference:
         self._booster.load_model(path)
         self._feature_names = self._booster.feature_names
 
-    def _load_split_xgb(self):
-        """Load separate long/short XGBoost models. Falls back to single model if files missing."""
+    def _load_split(self, model_type: str):
+        """Load separate long/short models for any supported type. Falls back to single model."""
         import os
-        long_path = config.MODEL_PATH_XGB_LONG
-        short_path = config.MODEL_PATH_XGB_SHORT
-        if os.path.exists(long_path) and os.path.exists(short_path):
+        path_map = {
+            "xgb": (config.MODEL_PATH_XGB_LONG, config.MODEL_PATH_XGB_SHORT),
+            "lgb": (config.MODEL_PATH_LGB_LONG, config.MODEL_PATH_LGB_SHORT),
+            "catboost": (config.MODEL_PATH_CB_LONG, config.MODEL_PATH_CB_SHORT),
+        }
+        long_path, short_path = path_map[model_type]
+        if not (os.path.exists(long_path) and os.path.exists(short_path)):
+            logger.warning(f"Split {model_type} files not found ({long_path}, {short_path}), falling back to single model")
+            self._split_model = False
+            {"xgb": self._load_xgb, "lgb": self._load_lgb, "catboost": self._load_catboost}[model_type]()
+            return
+
+        if model_type == "xgb":
             self._booster_long = xgb.Booster()
             self._booster_long.load_model(long_path)
             self._booster_short = xgb.Booster()
             self._booster_short.load_model(short_path)
             self._feature_names = self._booster_long.feature_names
-            logger.info(f"Split models loaded: {long_path}, {short_path}")
-        else:
-            logger.warning(f"Split model files not found, falling back to single model")
-            self._split_model = False
-            self._load_xgb()
+        elif model_type == "lgb":
+            import lightgbm as lgb
+            self._lgb_long = lgb.Booster(model_file=long_path)
+            self._lgb_short = lgb.Booster(model_file=short_path)
+            self._feature_names = self._lgb_long.feature_name()
+        elif model_type == "catboost":
+            from catboost import CatBoostClassifier
+            self._cb_long = CatBoostClassifier()
+            self._cb_long.load_model(long_path)
+            self._cb_short = CatBoostClassifier()
+            self._cb_short.load_model(short_path)
+            self._feature_names = self._cb_long.feature_names_
+
+        logger.info(f"Split {model_type} models loaded: {long_path}, {short_path}")
 
     def _load_lgb(self):
         import lightgbm as lgb
@@ -168,16 +188,19 @@ class ModelInference:
         row = _prepare_features(feat_row, event_dir, scanner_score, event_features)
 
         if self._split_model:
-            # Route to direction-specific model and threshold
-            if event_dir == 1:
-                booster = self._booster_long
-                threshold = config.LONG_THRESHOLD
-            else:
-                booster = self._booster_short
-                threshold = config.SHORT_THRESHOLD
+            threshold = config.LONG_THRESHOLD if event_dir == 1 else config.SHORT_THRESHOLD
             values = self._extract_values(row)
-            dmat = xgb.DMatrix(np.array([values]), feature_names=self._feature_names, missing=np.nan)
-            prob = float(booster.predict(dmat)[0])
+
+            if self._model_type == "xgb":
+                booster = self._booster_long if event_dir == 1 else self._booster_short
+                dmat = xgb.DMatrix(np.array([values]), feature_names=self._feature_names, missing=np.nan)
+                prob = float(booster.predict(dmat)[0])
+            elif self._model_type == "lgb":
+                model = self._lgb_long if event_dir == 1 else self._lgb_short
+                prob = float(model.predict(np.array([values]))[0])
+            elif self._model_type == "catboost":
+                model = self._cb_long if event_dir == 1 else self._cb_short
+                prob = float(model.predict_proba(np.array([values]))[0, 1])
         elif self._model_type == "stacked":
             xgb_p = self._predict_xgb(row)
             lgb_p = self._predict_lgb(row)

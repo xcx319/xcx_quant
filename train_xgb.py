@@ -580,6 +580,46 @@ def select_high_precision_threshold(
     return picked
 
 
+def select_quality_threshold(
+    valid_df: pd.DataFrame,
+    min_valid_trades: int,
+    smooth_window: int,
+) -> pd.Series | None:
+    """Select threshold that maximises a quality score balancing avg_r, win_rate
+    and drawdown.  score = avg_r * win_rate / (-max_drawdown_r + 1).
+
+    Compared to select_threshold (which maximises total net_profit and tends to
+    pick lower thresholds with more trades), this favours higher thresholds that
+    produce fewer but higher-quality trades with smaller drawdowns.
+    """
+    if valid_df.empty:
+        return None
+
+    cand = valid_df[valid_df["trades"] >= min_valid_trades].sort_values("threshold").copy()
+    if cand.empty:
+        return None
+
+    if smooth_window > 1:
+        cand["_avg_r"] = cand["avg_r"].rolling(window=smooth_window, min_periods=1, center=True).mean()
+        cand["_wr"] = cand["win_rate"].rolling(window=smooth_window, min_periods=1, center=True).mean()
+        cand["_dd"] = cand["max_drawdown_r"].rolling(window=smooth_window, min_periods=1, center=True).mean()
+    else:
+        cand["_avg_r"] = cand["avg_r"]
+        cand["_wr"] = cand["win_rate"]
+        cand["_dd"] = cand["max_drawdown_r"]
+
+    # quality = avg_r * win_rate / (-max_drawdown + 1)
+    # higher avg_r, higher win_rate, smaller |drawdown| → higher score
+    cand["_quality"] = cand["_avg_r"] * cand["_wr"] / (-cand["_dd"] + 1.0)
+    # only keep candidates with positive avg_r
+    cand = cand[cand["_avg_r"] > 0]
+    if cand.empty:
+        return None
+
+    picked = cand.sort_values("_quality", ascending=False).iloc[0]
+    return picked
+
+
 def evaluate_strategy(model, split_data):
     print("\n" + "=" * 40)
     print("STRATEGY PERFORMANCE REPORT")

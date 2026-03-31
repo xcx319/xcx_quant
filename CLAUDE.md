@@ -70,6 +70,8 @@ python test_horizon_close.py   # Compare horizon-close vs hold-until-TP/SL PnL
 
 - **`tune_xgb_params.py`** — Hyperparameter grid search for XGBoost using the same multi-fold OOS framework. Outputs `xgb_param_search.csv`.
 
+- **`train_long_short_split.py`** — Trains separate long/short models with per-direction TP/SL/threshold. Splits dataset by `event_dir`, trains independent XGBoost classifiers for each direction.
+
 - **`compare_post_windows.py`** — Compares event-aligned feature windows (5s/10s/15s/20s) by running pipeline → grid search → robust OOS for each. Outputs `robust_oos_pw{N}.csv`.
 
 ### Live Trading System (`live/`)
